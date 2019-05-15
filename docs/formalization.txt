@@ -1,0 +1,2384 @@
+--------------------------------------------------------------------------------
+ZIPPER SYNTAX
+--------------------------------------------------------------------------------
+
+(* Basic definitions *)
+
+s in Strings (Sigma*) (* Not including "/",".", or "..")
+d in Data (type of a file, left purposely vague, possibly we'll choose
+           something very specific, or allow flexible file types)
+i in Integer (Z)
+x in Variables
+v in Value (* Data, Trees, Bools, other? *)
+b in Boolean Expressions
+
+
+(* Core Language *)
+
+Tree t ::= Dir of (s * t) list | File of d
+           (List of name,node pairs or data leaf)
+Zipper z ::=
+       { ancestor : zipper option;
+         left : (s * t) list;
+         right : (s * t) list;
+         current : s * t}
+
+Path p ::= p1 * p2 | s | "/" | ".." | "."  (concat (*) is right-associative)
+Expression e ::= x | p | t | i | s | ...
+
+(*
+   Has_child    : StringExpression -> Expression
+
+   Goto         : PathExpression   -> Command
+   GotoChild    : StringExpression -> Command
+   GoDoReturn   : PathExpression -> Command -> Command
+   Update       : TreeExpression   -> Command
+   Remove_child : StringExpression -> Command
+   Add_child    : StringExpression -> TreeExpression -> Command
+*)
+
+Function f ::= Fetch | Has_parent | Is_folder | Has_child e
+
+Command c ::= Up | Down | Next | Prev
+            | Goto e | GotoChild e | GoDoReturn e c
+            | Update e | Remove_child e | Add_child e1 e2
+
+            | Skip 
+            | c1;c2 | if b then c1 else c2
+            | x := e | x := f(e1,...,ek)
+            | Print e
+
+            | Commit | Abort
+
+            | Unset x
+
+(* TODO: Remove Unset x if we don't need it anymore based on improved proof*)
+
+(* TODO: Decide if we actually want to do a global log, or if we want
+         to store some auxiliary version information at each node (and
+         perhaps usage information, like 'read @ TS')
+
+         Log seems a bit more inelegant and doesn't properly leverage
+         the zipper structure, but in a sense, that can just be an
+         illusion that is properly gotten rid of by optimizing the
+         movement used to check the log and apply updates.
+ *)
+
+Operation op ::= read | write
+
+LogEdit le ::= op @ p @ TS | op @ p
+
+--------------------------------------------------------------------------------
+ZIPPER SEMANTICS
+--------------------------------------------------------------------------------
+
+(* TODO: Improvements:
+   - Firm up how we want to record operations
+   - After we do above, figure out how conservative we need to be in
+     adding movements to the log (in a sense, they're all reads...)
+   - Instead of getting stuck in various failure cases, actually
+     signal failures somehow?
+*)
+
+Context: Tree * TxLog * (PID -> Env * Zipper * TxLog)
+(Global file system tree and transaction log and a mapping from process ids to
+a local environment (variable to value mapping), zipper, and log)
+
+-o-> : (Tree * TxLog * PIDMap * Command) ->
+       Observation * (Tree * TxLog * PIDMap * Command)
+       where the o is the observation
+
+(* Helper functions *)
+
+rem_child : string -> (string * Tree) list -> (string * Tree) list
+
+current_node : Zipper -> Tree
+current_node z = snd z.current
+
+command_of_list : Command list -> command
+
+ancestor_list : Zipper -> string list
+
+(* Transaction related *)
+
+make_zipper : Tree -> Zipper
+extract_tree: Zipper -> Tree
+
+get_fresh_TS: () -> TS
+
+get_path: Zipper -> Path
+
+(* Checks the local log against the global log to see if there are
+   conflicts by:
+   - Filtering the global log to remove events that happened before
+     current process started (i.e. pre given TS)
+   - Checking if there are any reads in the local log to subpaths
+     of writes in global log
+   - If there are, return false, else return true
+   (* TODO: Note that this allows blind writes, which we could decide
+      we don't want *)
+*)
+
+check_log: Log -> Log -> TimeStamp -> Bool
+(* Global -> local -> local TS -> safe-to-commit? *)
+
+
+(* Applies the updates detailed in the local log to the global tree by:
+   - Reversing the log and extracting the writes
+   - For each line of the new log, going to that path in the tree and
+     zipper and replacing the node in the tree with the one in the zipper
+*)
+
+apply_updates: Tree -> Log -> Zipper -> Tree
+
+
+(* Updates the Global log using the local log and PIDMap by:
+   - Extracting the writes from the local log
+   - Setting them to have happened during the newest TimeStamp
+   - Prepending the result to the global log
+   - Compacting the result by getting rid of the commits that finished
+     before any current process started
+*)
+
+update_log: Log -> Log -> PIDMap -> Log
+
+(* Expression Evaluation *)
+
+[[ . ]] : Expression -> Environment -> Value(?)
+(* This is partial, although maybe it shouldn't be. If you try to get
+a variable that hasn't been defined then behavior is undefined atm. *)
+
+[[ x ]] (E,_) = E(x)   
+
+(* Path evaluation *)
+
+(| . |) : Path -> Zipper -> Command
+
+(| "/" |) z = command_of_list (map (ancestor_list z) Up)
+
+(| p1 * p2 |) z = (| p1 |) z; (| p2 |) z
+      
+(| ".." |) _ = Up
+     
+(| "." |) _ = Skip
+(|  s  |) _ = GotoChild s
+
+(* Anti-path (return) evaluation *)
+
+|( "/" )| z =
+   let path = reverse ((fst z.current) :: ancestor_list z) in
+   map (tail path)  (fun s -> GotoChild s) |> command_of_list
+
+|( p1 * p2 )| z = |( p2 )| z; |( p1 )| z
+      
+|( ".." )| z = GotoChild (fst z.current)
+     
+|( "." )| _ = Skip
+|( s )| _ = Up
+
+(* Command/Function Semantics *)
+
+(* Function Semantics *)
+
+F[[ . ]] : Function -> Env * Zipper * Log -> Expression list ->
+           Log * Value
+           
+F[[ Fetch ]] (E,z,l) [] =
+   let le = read @ (get_path z) in
+   (le :: l, current_node z)
+
+F[[ Has_parent ]] (E,z,l) [] =
+   let le = read @ (get_path z) in
+   match z.ancestor with
+   | None -> (le :: l, false)
+   | _    -> (le :: l, true)
+
+F[[ Is_folder ]] (E,z,l) [] =
+   let le = read @ (get_path z) in
+   match current_node z with
+   | Dir _ -> (le :: l,true)
+   | _ -> (le :: l,false)
+
+[[ Has_child ]]  (E,z,l) [e] =
+   let le = read @ (get_path z) in
+   match current_node z with
+   | Dir dl -> (le :: l, exists ([[e]] E) dl)
+
+(* TODO: Decide if we want this to be partial, or to just say false if
+current_node isn't a folder *)
+
+(* Command Semantics *)
+
+Commands are indexed by Process ID.
+
+(* Movement *)
+
+(_,z,_) = M(i)
+Dir((name,_) :: _) = current_node z
+---------------------------------
+<T,L,M,Down_i> -> <T,L,M,GotoChild_i name>
+
+(E,z,l) = M(i)
+s = [[e]] E
+(name, Dir(left @ (s,t) :: right)) = z.current
+ancestor = {z with current = (name,Dir([]))}
+z' = {ancestor = Some ancestor;
+      left = reverse left;
+      right; 
+      current = (s,t)}
+M' = M[i |-> (E,z',l)]
+---------------------------------
+<T,L,M,GotoChild_i e> -> <T,L,M',Skip>
+
+(E,z,l) = M(i)
+Some(ancestor) = z.ancestor
+(name,_) = ancestor.current 
+z' = { ancestor with current = (name, Dir(reverse z.left @ (z.current :: z.right)))}
+M' = M[i |-> (E,z',l)]
+---------------------------------
+<T,L,M,Up_i> -> <T,L,M',Skip>
+
+
+(E,z,_) = M(i)
+p = [[e]] E
+c = (| p |) z
+---------------------------------
+<T,L,M,Goto_i e> -> <T,L,M,c_i>
+
+
+(E,z,_) = M(i)
+p = [[e]] E
+c' = (| p |) z
+     ; c
+     ; |( p )| z
+---------------------------------
+<T,L,M,GoDoReturn_i e c> -> <T,L,M,c'_i>
+
+
+(** Both Next and Prev should get stuck if we are at last or first
+child respectively *)
+
+
+(E,z,l) = M(i)
+current :: right = z.right
+z' = {z with
+      left = z.current :: z.left;
+      right;
+      current}
+M' = M[i |-> (E,z',l)]
+---------------------------------
+<T,L,M,Next_i> -> <T,L,M',Skip>
+
+
+(E,z,l) = M(i)
+current :: left = z.left
+z' = {z with
+      left;
+      right = z.current :: z.right;
+      current}
+M' = M[i |-> (E,z',l)]
+---------------------------------
+<T,L,M,Prev_i> -> <T,L,M',Skip>
+
+
+(* Updates *)
+
+(E,z,l) = M(i)
+(name,_) = z.current
+t = [[e]] E
+z' = {z with current = (name,t)}
+le = write @ (get_path z')
+M' = M[i |-> (E,z',le :: l)]
+-----------------------------
+<T,L,M,Update_i e> -> <T,L,M',Skip>
+
+
+(E,z,_) = M(i)
+Dir(children) = current_node z
+t' = Dir(rem_child ([[e]] E) children)
+-----------------------------
+<T,L,M,Remove_child_i e> -> <T,L,M,Update_i t'>
+
+
+(E,z,_) = M(i)
+Dir(children) = current_node z
+t' = Dir(([[e1]] E,[[e2]] E) :: children)
+-----------------------------
+<T,L,M,Add_child_i e1 e2> -> <T,L,M,Update_i t'>
+
+
+(* PID removers/propagaters *)
+
+-----------------------------
+<T,L,M,Skip_i> -> <T,L,M,Skip>
+
+-----------------------------
+<T,L,M,(c1;c2)_i> -> <T,L,M,c1_i;c2_i>
+
+(* Rest *)
+
+-----------------------------
+<T,L,M,Skip;c2> -> <T,L,M,c2>
+
+
+<T,L,M,c1_i> -o_i-> <T',L',M',c1'>
+-----------------------------
+<T,L,M,c1_i;c2> -o_i-> <T',L',M',c1';c2>
+
+
+(E,z,_) = M(i)
+[[ b ]] E
+-----------------------------
+<T,L,M,(if b then c1 else c2)_i> -> <T,L,M,c1_i>
+
+
+(E,z,_) = M(i)
+NOT [[ b ]] E
+-----------------------------
+<T,L,M,(if b then c1 else c2)_i> -> <T,L,M,c2_i>
+
+
+(E,z,l) = M(i)
+E' = E[x |-> [[e]] E]
+M' = M[i |-> (E',z,l)]
+-----------------------------Assign-E
+<T,L,M,x :=_i e> -> <T,L,M',Skip>
+
+
+(_,z,_) = M(i)
+(l',v) = F[[f]] M(i) [e1;...;ek]
+E' = E[x |-> v]
+M' = M[i |-> (E',z,l')]
+-----------------------------Assign-F
+<T,L,M,x :=_i f(e1,...,ek)> -> <T,L,M',Skip>
+
+
+(E,z,_) = M(i)
+v = [[e]] E
+-----------------------------
+<T,L,M,Print_i e> -v_i-> <T,L,M,Skip>
+
+
+(E,z,l) = M(i)
+T' = extract_tree z
+----------------------------- Commit-Unsafe
+<T,L,M,Commit_i> -> <T',L,M,Skip>
+
+
+(E,z,l) = M(i)
+check_log L l E(TS)
+T' = apply_updates T l z
+E' = E[TS |-> get_fresh_TS ()]
+M' = M[i |-> (E',z,[])]
+L' = update_log L l M'
+----------------------------- Commit-Safe-succeed
+<T,L,M,Commit_i> -> <T',L',M',Skip>
+
+
+(E,z,l) = M(i)
+NOT (check_log L l E(TS))
+----------------------------- Commit-Safe-fail
+<T,L,M,Commit_i> -> <T,L,M,Skip>
+
+(*TODO: This abort keeps the old environment, which means we don't
+ actually get the isolation properties we're likely to want.
+ Potential solutions:
+ 
+ - We could store a pre-transaction environment (that updates on
+   commits) as well.
+ - If we include a Start command, we would instead want a stack of
+   such environments (and zippers) and we would support nested
+   transactions. 
+*)
+
+(E,_,_) = M(i)
+z = make_zipper T
+M' = M[i |-> (E,z,[])]
+-----------------------------
+<T,L,M,Abort_i> -> <T,L,M',Skip>
+
+
+(E,z,l) = M(i)
+M' = M[i |-> (E \ ,z,l)]
+-----------------------------
+<T,L,M,Unset_i x> -> <T,L,M',Skip>
+
+
+(* MultiStep *)
+
+<T,L,M,c> -o-> <T',L',M',Skip>
+-----------------------------
+<T,L,M,c> -o->*  <T',L',M',Skip>
+
+
+<T,L,M,c> -o-> <T'',L'',M'',c''>
+c'' <> Skip
+<T'',L'',M'',c''> -l->* <T',L',M',Skip>
+-----------------------------
+<T,L,M,c> -o :: l->*  <T',L',M',Skip>
+
+
+--------------------------------------------------------------------------------
+POSIX SYNTAX
+--------------------------------------------------------------------------------
+
+fd in FD (set of file descriptors)
+s in Strings (Sigma*) 
+i in Integer (Z)
+l in Path List
+x in Variables
+
+
+Expression e ::= p | fd | x | i | s | b | ...
+
+(*
+   open    : PathExpression -> FD
+   close   : FDExpression   -> ErrorCode
+   read    : FDExpression   -> Char + ErrorCode
+   readdir : FDExpression   -> DirEntry + ErrorCode
+   write   : FDExpression   -> StringExpression -> ErrorCode
+
+   remove  : PathExpression -> ErrorCode
+   mkdir   : PathExpression -> ErrorCode 
+   chdir   : PathExpression -> ErrorCode
+
+*)
+
+POSIX Function pf ::= open | close | read | readdir
+                     | write | remove | mkdir | chdir
+
+POSIX Command pc ::= Skip
+                   | pc1;pc2 | if b then pc1 else pc2
+                   | x := e | x := pf(e1,...,ek)
+                   | Print e
+                   
+Nodes n ::= File(s) | Dir(l)
+
+--------------------------------------------------------------------------------
+POSIX SEMANTICS
+--------------------------------------------------------------------------------
+
+(* Expression Evaluation *)
+
+[[ . ]] : Expression -> Env -> Value(?)
+
+
+(* POSIX Commands/Functions *)
+
+Context: E * F * Path (Environment (variable to value map), Filestore (path to
+node map, and working path)
+
+-> : (E * F * Path * POSIX Command) -> (E * F * Path * POSIX Command)
+
+
+(* Definitions *)
+
+Definition FS: A well-formed file system F has the following properties:
+
+ 1. "/" in dom(F) AND F("/") = Dir(_)
+ 2. \forall p1 * s in dom(F). p1 in dom(F) AND F(p1) = Dir(l) where s
+    in l
+ 3. \forall p in dom(F). NOT (".." in p) AND NOT ("." in p)
+
+(* Helpers *)
+
+get_fresh_fd: FDMap -> fd
+canonicalize: Path -> Path -> Path
+
+
+(* Function semantics *)
+
+All rules assume (and preserve) well-formedness of the FS.
+
+PF[[ . ]] : Function -> Env * Filestore * Path * Expression list ->
+           Env * Filestore * Path * Value
+
+PF[[ open ]] (E,F,wp,[e]) =
+  let p = [[e]] E in
+  let S = E(posix_fds) in
+  let fd = get_fresh_fd S in
+  let p' = canonicalize wp p in
+  let E' = set E posix_fds (set S fd (p',0)) in
+  (E',F,wp,fd)
+
+PF[[ close ]] (E,F,wp,[e]) =
+  let fd = [[e]] E in
+  let S = E(posix_fds) in
+  if fd in dom(S)
+  then
+   let E' = set E posix_fds (S \ fd) in
+   (E',F,wp,0)
+  else
+   (E,F,wp,-1)
+
+PF[[ read ]] (E,F,wp,[e]) =
+  let fd = [[e]] E in
+  if fd in dom(E(posix_fds))
+  then
+    let (p,i) = E(posix_fds)(fd) in
+    match F(p) with
+    | Some (File s) when |s| > i ->
+      let E' = set E posix_fds (set E(posix_fds) fd (p,i+1)) in
+      (E',F,wp,s[i])
+    | _ -> (E,F,wp,-1)
+  else
+    (E,F,wp,-1)
+
+PF[[ readdir ]] (E,F,wp,[e]) =
+  let fd = [[e]] E in
+  if fd in dom(E(posix_fds))
+  then
+    let (p,i) = E(posix_fds)(fd) in
+    match F(p) with
+    | Some (Dir l) when |l| > i ->
+      let E' = set E posix_fds (set E(posix_fds) fd (p,i+1)) in
+      (E',F,wp,l[i])
+    | _ -> (E,F,wp,-1)
+  else
+    (E,F,wp,-1)
+
+
+PF[[ write ]] (E,F,wp,[e1;e2]) =
+  let fd = [[e1]] E in
+  let s = [[e2]] E in
+  if fd in dom(E(posix_fds))
+  then
+    let (p,i) = E(posix_fds)(fd) in
+    match F(p) with
+    | Some (File s') when |s'| >= i ->
+      let E' = set E posix_fds (set E(posix_fds) fd (p,i + |s|)) in
+      let F' = set F p (Some (File (replace_string_from s' i s))) in
+      (E',F',wp,0)
+    | None when i = 0 ->
+      let E' = set E posix_fds (set E(posix_fds) fd (p,|s|)) in
+      let F' = set F p (Some (File s)) in
+      (E',F',wp,0)
+    | _ -> (E,F,wp,-1)      
+  else
+    (E,F,wp,-1)
+
+PF[[ remove ]] (E,F,wp,[e]) =
+  let p = [[e]] E in
+  let p' = canonicalize wp p in
+  match F(p') with
+  | Some (File _) 
+  | Some (Dir []) ->
+    (E,F \ p, wp, 0)
+    
+  | _ -> (E,F,wp,-1)
+
+
+(* TODO: Found a bug in old Mkdir, so check translation + proofs *)
+
+PF[[ mkdir ]] (E,F,wp,[e]) =
+  let p = [[e]] E in
+  let p1 * s = canonicalize wp p in
+  match F(p1) with 
+  | Some (Dir l) when (NOT (s in l)) ->
+    let F' = set F (p1 * s) (Some (Dir [])) in
+    let F'' = set F' p1 (Some (Dir (s :: l))) in
+    (E,F'', wp, 0)
+  | _ -> (E,F,wp,-1)
+
+
+PF[[ chdir ]] (E,F,wp,[e]) =
+  let p = [[e]] E in
+  let wp' = canonicalize wp p in
+  match F(wp') with
+  | Some (Dir _) ->
+    (E,F, wp', 0)
+  | _ -> (E,F,wp,-1)
+
+
+(* Command semantics *)
+
+All rules assume well-formedness in the FS.
+
+
+[[ b ]] E
+--------------------------------- If-True
+<E,F,wp,if b then pc1 else pc2> -> <E,F,wp,pc1>
+
+NOT ([[ b ]] E)
+--------------------------------- If-False
+<E,F,wp,if b then pc1 else pc2> -> <E,F,wp,pc2>
+
+
+E' = E[x |-> [[e]] E ]
+--------------------------------- Assign_e
+<E,F,wp,x := e> -> <E',F,wp,Skip>
+
+
+(E',F',wp',v') = PF[[ pf ]] (E,F,wp,[e1;...;ek])
+--------------------------------- Assign_F
+<E,F,wp,x := pf(e1,...,ek)> -> <E'[x |-> v],F',wp',Skip>
+
+
+v = [[e]] E
+-----------------------------
+<E,F,wp,Print e> -v-> <E,F,wp,Skip>
+
+
+(* Composition *)
+
+-----------------------------
+<E,F,wp,Skip;pc2> -> <E,F,wp,pc2>
+
+
+<E,F,wp,pc1> -o-> <E',F',wp',pc1'>
+-----------------------------
+<E,F,wp,pc1;pc2> -o-> <E',F',wp',pc1';pc2>
+
+
+(* MultiStep *)
+
+<E,F,wp,pc> -o-> <E',F',wp',Skip>
+-----------------------------
+<E,F,wp,pc> -[o]->* <E',F',wp',Skip>
+
+
+<E,F,wp,pc> -o-> <E'',F'',wp'',pc''>
+pc'' <> Skip
+<E'',F'',wp'',pc''> -l->* <E',F',wp',Skip>
+-----------------------------
+<E,F,wp,pc> -o :: l->* <E',F',wp',Skip>
+
+--------------------------------------------------------------------------------
+STORAGE SYNTAX
+--------------------------------------------------------------------------------
+
+s in Strings (Sigma*) 
+i in Integer (Z)
+x in Variables
+
+Expressions e ::= x | i | s | b | ...
+
+(*
+   sizeof : InodeExpression -> Size + ErrorCode
+   create : SizeExpression  -> Inode + ErrorCode
+   free   : InodeExpression -> ErrorCode
+   read   : InodeExpression -> IntExpression -> IntExpression -> String + ErrorCode
+   write  : InodeExpression -> StringExpression -> ErrorCode
+*)
+
+Storage Functions sf ::= create | free | read | write | sizeof
+
+Storage Command sc ::= Skip
+                     | sc1;sc2 | if b then sc1 else sc2
+                     | x := e | x := sf(e1,...,ek)
+                     | Print e
+                     
+                     | Unset x
+                   
+An inode is a pointer to a storage location containing its content
+(string) and a region (int * int) where it is stored.
+
+--------------------------------------------------------------------------------
+STORAGE SEMANTICS
+--------------------------------------------------------------------------------
+
+
+(* Expression Evaluation *)
+
+[[ . ]] : Expression -> Environment -> Value(?)
+
+(* Storage Commands/Functions *)
+
+Context: E * S (Environment (variable to value map) and Storage (inode
+to region (int * int) * String mapping))
+
+-> : (E * S * Storage Command) -> (E * S * Storage Command)
+
+
+(* Helpers *)
+
+get_fresh_inode: Storage -> Inode
+new_region: Size -> Storage -> (int * int)
+
+size: String/(int*int) -> Size
+overlaps: (int * int) -> (int * int) -> Bool
+
+(* Definitions *)
+
+Definition S: A well-formed storage is one where:
+
+1. No mapped regions overlap, i.e. \forall i in dom(S).   
+   NOT \exists j in dom(S). overlaps (fst S(i)) (fst S(j))
+2. The string mapped is larger than the region it is mapped to, i.e.
+   \forall i in dom(S).
+   size (snd S(i)) <= size (fst S(i))
+
+Definition Buffer: A buffer is a variable (pointing to a string in the environment)
+
+(* Function semantics *)
+
+All rules assume (and preserve) well-formedness of the Storage.
+
+SF[[ . ]] : E * S * Expression list -> E * S * Value
+
+SF[[ create ]] (E,S,[e]) =
+  let size = [[e]] E in
+  if size <= 0
+  then (E,S,-1)
+  else
+    let inode = get_fresh_inode S in
+    let S' =  set S inode {region = (new_region size S); content = ""} in
+    (E,S',inode)
+
+
+SF[[ free ]] (E,S,[e]) =
+  let inode = [[e]] E in
+  if inode in dom(S)
+  then 
+    (E,S \ inode,0)
+  else
+    (E,S,-1)
+
+SF[[ read ]] (E,S,[e1;e2;e3]) =
+  let inode  = [[e1]] E in
+  if inode in dom(S)
+  then 
+    let start  = [[e2]] E in
+    let length = [[e3]] E in
+    if 0 <= start AND length > 0 AND start + length <= size S(inode).content
+    then
+      let string = S(inode).content[start:(start+length)] in
+      
+    else
+      (E,S,-1)
+
+  else
+    (E,S,-1)
+
+
+(* TODO: Determine if you want this to be size of the inode or size of
+the actual string *)
+
+SF[[ sizeof ]] (E,S,[e]) =
+  let inode  = [[e]] E in
+  if inode in dom(S)
+  then
+    let size = (snd S(inode).region) - (fst S(inode).region) in
+    (E,S,size)
+  else
+    (E,S,-1)
+
+
+(* Command semantics *)
+
+inode  = [[e1]] E
+start  = [[e2]] E
+buffer = [[e3]] E
+inode in dom(S)
+string = snd S(inode)
+0 <= start < size string
+size buffer > 0
+E' = E[buffer -> string[start:min(size buffer,size string - start)]]
+--------------------------------- Read
+<E,S,read e1 e2 e3> -> <E',S,Skip>
+
+
+inode  = [[e1]] E
+string = [[e2]] E
+inode in dom(S)
+size string <= size (fst S(inode))
+S' = S[inode |-> (fst S(inode)) * string]
+--------------------------------- Write
+<E,S,write e1 e2> -> <E,S',Skip>
+
+
+(* Rest *)
+
+-----------------------------
+<E,S,Skip;sc2> -> <E,S,sc2>
+
+
+<E,S,sc1> -> <E',S',sc1'>
+-----------------------------
+<E,S,sc1;sc2> -> <E',S',sc1';sc2>
+
+[[ b ]] E
+-----------------------------
+<E,S,if b then sc1 else sc2> -> <E,S,sc1>
+
+
+NOT [[ b ]] E
+-----------------------------
+<E,S,if b then sc1 else sc2> -> <E,S,sc2>
+
+
+E' = E[x |-> [[e]] E]
+-----------------------------
+<E,S,x := e> -> <E',S,Skip>
+
+
+-----------------------------
+<E,S,Unset x> -> <E \ x,S,Skip>
+
+
+(* MultiStep *)
+
+<E,S,sc> -> <E',S',Skip>
+-----------------------------
+<E,S,sc> ->* <E',S',Skip>
+
+
+<E,S,sc> -> <E'',S'',sc''>
+sc'' <> Skip
+<E'',S'',sc''> ->* <E',S',Skip>
+-----------------------------
+<E,S,sc> ->* <E',S',Skip>
+
+
+--------------------------------------------------------------------------------
+Zipper -> Storage TRANSLATION
+--------------------------------------------------------------------------------
+
+(* Helpers *)
+
+(* TODO: Maybe separate into metadata (parent, name?) and contents? *)
+
+to_dir  : String -> Inode * (String * Inode) list (* Parent + list of children *)
+to_file : String -> Inode * String (* Parent + contents *)
+
+from_dir  : Inode * String list -> String
+from_file : Inode * String -> String
+
+empty_buffer : Size -> Buffer
+
+(* TODO: What if these fail? *)
+hd : 'a list -> 'a
+get: 'a -> ('a * 'b) list -> 'b
+remove: 'a -> ('a * 'b) list -> ('a * 'b) list
+replace: 'b -> 'b -> ('a * 'b) list -> ('a * 'b) list
+
+(* TODO: What if fst argument is not in list? Or if it's last/first? *)
+get_next_inode: Inode -> (string * Inode) list -> Inode
+get_prev_inode: Inode -> (string * Inode) list -> Inode
+
+(* [| . |] defines the translation between Zipper and Storage commands *)
+
+(** Notes:
+  * 1. We use the $CURRENT_INODE variable to store our current location
+  *)
+
+[| . |] : Command -> Storage Command
+
+(* TODO: We'll probably have to do some update propagation here :( *)
+
+[| Up |]   =
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; $CURRENT_INODE := fst (to_dir buffer)
+   ; Unset buffer
+
+where buffer is fresh
+
+[| Down |] =
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; $CURRENT_INODE := snd (hd (snd (to_dir buffer)))
+   ; Unset buffer
+
+where buffer is fresh
+
+[| Next |] = 
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; buffer := empty_buffer (sizeof parent_inode)
+   ; read parent_inode 0 buffer
+   ; $CURRENT_INODE := get_next_inode $CURRENT_INODE (snd (to_dir buffer))
+   ; Unset [buffer;parent_inode;parent]
+
+where buffer,parent_inode, and parent are fresh
+
+[| Prev |] =
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; buffer := empty_buffer (sizeof parent_inode)
+   ; read parent_inode 0 buffer
+   ; $CURRENT_INODE := get_prev_inode $CURRENT_INODE (snd (to_dir buffer))
+   ; Unset [buffer;parent_inode;parent]
+
+where buffer,parent_inode, and parent are fresh
+
+(* TODO: Need to implement paths to do Goto... Or can we offload on
+higher level zipper? I guess then we'd need to define some bijection
+anyway... *)
+[| Goto e |]
+[| GoDoReturn e c |]
+
+[| GotoChild e |] = 
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; buffer := empty_buffer (sizeof parent_inode)
+   ; read parent_inode 0 buffer
+   ; $CURRENT_INODE := get e (snd (to_dir buffer))
+   ; Unset [buffer;parent_inode;parent]
+
+where buffer, parent_inode, and parent are fresh
+
+
+(* TODO: We need to make sure that the way tree expressions are
+evaluated matches with how we then use them. Right now we assume that
+they look like the zipper trees, but depending on how we do expression
+translation this may need modification *)
+
+[| Update e |] = 
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; contents :=
+     match e with
+     | Dir l -> (* TODO: This is non trivial and recursive :( *)
+     | File s -> from_file (parent_inode,s)
+   ; inode := $CURRENT_INODE
+   ; if size contents <= sizeof inode then Skip
+     else
+     (
+        (* Updates the parent since we otherwise lose both this inode and its name *)
+        old_inode := inode
+        ; inode = new_inode
+        ; buffer := empty_buffer (sizeof parent_inode)
+        ; read parent_inode 0 buffer
+        ; pp_inode := fst (to_dir buffer)
+        ; pp_contents := replace old_inode inode (snd (to_dir buffer))
+        ; write parent_inode (from_dir (pp_inode,pp_contents))
+        ; create inode (size contents)
+        ; free old_inode
+     )
+   ; write inode contents
+   ; $CURRENT_INODE := inode
+   ; Unset [buffer; parent_inode; contents; inode]
+
+(* TODO: If we wanna allow hard links, we should keep a count in the
+inode metadata and only free if count is 0 *)
+
+[| Remove_child e |] = 
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; removed_inode := get (snd (to_dir buffer))
+   ; new_contents := remove (snd (to_dir buffer))
+   ; free removed_inode
+   ; write $CURRENT_INODE (from_dir (parent_inode, new_contents))
+   ; Unset [buffer; parent_inode; removed_inode; new_contents]
+
+where buffer, parent_inode, removed_inode, and new_contents are fresh
+   
+[| Add_child e1 e2 |] =
+   buffer := empty_buffer (sizeof $CURRENT_INODE)
+   ; read $CURRENT_INODE 0 buffer
+   ; parent_inode := fst (to_dir buffer)
+   ; child := new_inode
+   ; child_contents :=
+     match e2 with
+     | Dir l -> (* TODO: This is non trivial and recursive :( *)
+     | File s -> from_file ($CURRENT_INODE,s)
+   ; create child (size child_contents)
+   ; write child child_contents
+   ; new_contents := (e1, child) :: (snd (to_dir buffer))
+   ; write $CURRENT_INODE (from_dir (parent_inode, new_contents))
+   ; Unset [buffer; parent_inode; child; child_contents; new_contents]
+
+where buffer, parent_inode, child, child_contents, and new_contents are fresh
+
+[| Skip |] = Skip
+[| c1;c2 |] = [|c1|];[|c2|]
+
+(* TODO: Some expression evaluation we'll need to specify, so
+we need an expression translation function too *)
+
+[| x := e |] = x := e
+[| if b then c1 else c2 |] = if b then [| c1 |] else [| c2 |]
+[| Unset x |] = Unset x
+
+--------------------------------------------------------------------------------
+POSIX -> ZIPPER TRANSLATION
+--------------------------------------------------------------------------------
+
+(* TODO: Necessary changes
+   - Add Function translation
+   - Wildly update command translation (to remove functions)
+*)
+
+(* Definitions *)
+
+All variables starting with '$' are reserved (i.e. can't be used by programmer)
+
+(* Helper functions *)
+
+dirname: Path -> Path
+basename: Path -> String
+
+get_ith: Int -> 'a list -> 'a
+fst: 'a * 'b -> 'a
+len: String -> Int
+
+replace_string_from: String -> Int -> String -> String
+
+is_file: Tree -> Bool
+
+contains: 'a Set -> 'a -> bool
+get_fresh: 'a Set -> 'a
+
+canonicalize: Path -> Path
+
+(* F[| . |] defines the translation between POSIX functions and zipper commands *)
+
+F[| . |] : POSIX Functions -> Command
+
+F[| open |] =
+  $p := canonicalize $e
+  ; $RET := get_fresh posix_fds
+  ; posix_fds($RET) := ($p,0)
+  
+
+F[| close |] =
+   $fd := $e;
+   if contains posix_fds $fd
+   then (posix_fds := posix_fds \ $fd; $RET := 0)
+   else $RET := -1;
+
+(* TODO: Read and Readdir should additionally fail if:
+   - The path is not in the FS (instead of getting stuck as it does atm)
+*)
+
+F[| read |] =
+  $fd := $e;
+  if NOT (contains posix_fds $fd) then $RET := -1
+  else
+  (
+    ($p,$i) := posix_fds($fd)
+    ; GoDoReturn $p ($node := Fetch)
+    ; (posix_fds($fd),$RET) :=
+      match $node with
+        | File s when |s| > $i ->
+          ($p,$i+1),s[i]
+        | _ -> ($p,$i),-1
+  )
+
+F[| readdir |] =
+  $fd := $e;
+  if NOT (contains posix_fds $fd) then $RET := -1
+  else
+  (
+    ($p,$i) := posix_fds($fd)
+    ; GoDoReturn $p ($node := Fetch)
+    ; (posix_fds($fd),$RET) :=
+      match $node with
+        | Dir l when |l| > $i ->
+          ($p,$i+1),(fst (get_ith i l))
+        | _ -> ($p,$i),-1
+  )    
+
+F[| write |] =
+  $fd := $e1;
+  $s := $e2;
+  if NOT (contains posix_fds $fd) then $RET := -1
+  else
+  (
+    ($p,$i) := posix_fds($fd)
+    ; GoDoReturn (dirname $p)
+    (
+      if Has_child (basename $p)
+      then
+      (
+        GotoChild (basename $p)
+        ; $node = Fetch
+        ; if NOT (is_file $node) || size $node < $i then $RET := -1
+          else
+          (
+            $new_node :=
+              match $node with File(s') ->
+                File(replace_string_from s' $i $s)
+            ; Update $new_node
+            ; posix_fds($fd) := ($p,$i + (len $s))
+            ; $RET := 0
+          )
+        ; Up
+      )
+      else
+      (
+        if $i <> 0 then $RET := -1
+        else
+        (
+          Add_child (basename $p) (File $s)
+          ; posix_fds($fd) := ($p,len $s)
+          ; $RET := 0
+      )
+    )
+  )
+  
+
+(* TODO: remove and mkdir should fail correctly:
+   - If the path given is not even partially reasonable (instead of
+     getting stuck)
+ *)
+
+F[| remove |] =
+  $p := $e;
+  GoDoReturn (dirname $p)
+  (
+    $child := basename $p;
+    if NOT (Has_child $child) then $RET := -1
+    else
+    (
+      GotoChild $child
+      ; if Is_folder AND Fetch <> Dir([]) then $RET := -1
+        (* Can only remove empty dirs *)
+        else
+        (
+          Up
+          ; Remove_child $child
+          ; $RET := 0
+        )
+    )
+  )
+
+F[| mkdir |] =
+  $p := $e;
+  GoDoReturn (dirname $p)
+    (
+      $child := basename $p;
+      if NOT Is_folder OR Has_child $child then $RET := -1
+      else
+      (
+        addChild $child (Dir [])
+        ; $RET := 0
+      )
+    )
+
+
+(* TODO: chdir should additionally fail if:
+   - If the path given is not even partially reasonable (instead of
+     getting stuck)
+   - p is not in F
+   
+     To support both of these, we either need to make a 'safe Goto' (that
+     checks if there's a folder/file there before going to it) or
+     change Zipper semantics
+*)
+
+[| chdir |] =
+   $p := $e
+   ; $anti_p := Get_anti_path $p
+   ; Goto $p
+   ; if is_file Fetch
+     then (Goto $anti_p; $RET := -1)
+     else $RET := 0
+
+(* [| . |] defines the translation between POSIX commands and zipper commands  *)
+
+[| . |] : POSIX Command -> Command
+
+[| Skip |] = Skip
+
+[| pc1; pc2 |] = [| pc1 |];[| pc2 |]
+
+[| if b then pc1 else pc2 |] = if b then [| pc1 |] else [| pc2 |]
+
+[| x := e |] = x := e
+
+[| x := f(e1,...,ek) |] =
+   ($e1,...,$ek) := (e1,...,ek) 
+   ; F[| f |]
+   ; x := $RET
+
+[| print e |] = print e
+
+
+--------------------------------------------------------------------------------
+Correctness Proofs
+--------------------------------------------------------------------------------
+
+----------------------------------------
+POSIX vs POSIX -> Zipper
+----------------------------------------
+
+(* I looked at some bisimulation papers and a CompCert paper and
+   decided to follow their example of proving a forward simulation and
+   determinism of the target language since I think that's a better
+   fit!
+*)
+
+(* TODO: Improvements:
+
+   1. Use well-formedness of FS to define a bijection
+      (wp * F) <-> Z  to shore up the proof
+   2. Define some sub-lemmas, like regarding GoDoReturn not changing
+      stuff if paired with the correct c
+   3. Just go through and clean-up a bit generally
+   4. Maybe define a -> relation that makes two reductions wherein the
+      last is always Skip;c -> c
+   5. Make sure we do errors properly.
+*)
+
+
+Firstly, note that the target language is clearly deterministic since
+the only branching is the if statement and it is fully determined by
+the zipper and environment.
+
+Observations are the value of $RET in the respective environments
+whenever it changes.
+
+WTS: The set of possible observations from <H,F,wp,pc> -pc->*
+<H',F',wp',Skip>, called O(pc) are a subset of those from <E,z,c>
+-c->* <E',z',Skip>, called O(c) assuming that <H,F,wp,pc> and <E,z,c>
+are properly related.
+
+Lemma: P simulates PZ. I.e.
+  \forall H,F,wp,pc,E,z,c.
+  \exists R. <H,F,wp,pc> R <E,z,c>
+  AND \exists H',F',wp',pc'. <H,F,wp,pc> -o-> <H',F',wp',pc'>
+  IMPLIES \exists E',z',c'. <E,z,c> -o->* <E',z',c'>
+          AND <H',F',wp',pc'> R <E',z',c'>
+
+
+where the stepping relations are the appropriate ones for the command
+type and multi-step observations are a list if multiple or else the
+singleton observation in the sequence.
+
+We define the relation R as:
+[| pc |] = c
+Obvious transformation on F+wp into z
+H = E
+
+(* TODO: Make sure we deal with errors properly and think about all of
+them? *)
+
+Proof:
+
+Note that in this proof we generally consider c1;c2 -> c2 if c1 ->
+Skip (instead of taking two steps) for brevity.
+
+We prove this by induction on pc:
+
+Case pc = Skip:
+  This is trivially true since Skip does not step
+
+Case pc = open e:
+
+  <H,F,wp,open e> -new_fd-> <H',F,wp,Skip>
+
+  where new_fd is the first available fresh file descriptor,
+  and   H' = H[posix_fds |-> (H(posix_fds) U {new_fd |-> (p',0)})]
+              [$RET |-> new_fd]
+     where p' is the absolute path that e yields when combined with wp.
+
+  <E,z,[| open e |]> = <E,z,c>
+  where c  = fd := get_fresh posix_fds
+             ; posix_fds(fd) := (canonicalize e,0)
+             ; $RET := fd
+             ; Unset fd
+          
+  <E,z,c> -> <E',z,c'>
+  where c' = posix_fds(fd) := (canonicalize e,0)
+             ; $RET := fd
+             ; Unset fd
+  and E' = E[fd |-> new_fd]
+  and new_fd is the same as above, since posix_fds is the same as above.
+
+  <E',z,c'> -> <E'',z,c''>
+  where c'' = $RET := fd
+             ; Unset fd
+  and E'' = E'[posix_fds |-> (E(posix_fds) U {new_fd |-> (p',0)})]
+  and p' is the same p' as above, since the wp in z is the same, and
+  E(posix_fds) = H(posix_fds)
+
+  <E'',z,c''> -new_fd-> <E''',z,Unset fd>
+  where E''' = E''[$RET |-> new_fd]
+  since fd evaluates to new_fd
+  
+  <E''',z,Unset fd> -> <E'''',z,Skip>
+  where E'''' = E''' \ fd
+
+  Collecting all of this, we get:
+  <E,z,c> -new_fd->* <E'''',z,Skip>
+  where E''''= E[posix_fds |-> (E(posix_fds) U {new_fd |-> (p',0)})]
+                [$RET |-> new_fd]
+  and the variables are the same as above.
+
+  And thus <H',F,wp,Skip> R <E'''',z,Skip> and the observations are
+  identical. 
+
+Case pc = close e:
+ 
+  c = [| close |] e = if contains posix_fds e
+                      then (posix_fds := posix_fds \ e; $RET := 0)
+                      else $RET := -1
+
+  This has two subcases, one where it fails and one where it succeeds:
+
+  Subcase Fail:
+
+    <H,F,wp,close e> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+    
+    This only happens if the evaluation of e is not in the domain of
+    H(posix_fds). Thus, it is also not in the domain of E(posix_fds),
+    and therefore
+
+    <E,z,c> -> <E,z,$RET := -1> -(-1)-> <E[$RET |-> -1],z,Skip>  
+
+  Subcase Success:
+
+    <H,F,wp,close e> -0-> <H',F,wp,Skip>
+    where H' = H[posix_fds |-> H(posix_fds) \ fd]
+                [$RET |-> 0]
+       where fd is the evaluation of e.
+
+    Then, since fd is in the domain of H(posix_fds) it must also be in
+    the domain of E(posix_fds) so:
+    
+    <E,z,c>   -> <E,z,posix_fds := posix_fds \ e; $RET := 0>
+              -> <E[posix_fds |-> E(posix_fds) \ fd],z,$RET := 0>  
+            -0-> <E',z,Skip>
+    where E' = [posix_fds |-> E(posix_fds) \ fd]
+               [$RET |-> 0]
+       where fd is the evaluation of e.
+
+
+  And thus <H',F,wp,Skip> R <E',z,Skip> and the observations are
+  identical in each case.
+
+Case pc = read e:
+
+  c = [| read |] e
+    = if contains posix_fds fd then $RET := -1
+      else
+      (
+        (p,i) := posix_fds(fd)
+        ; GoDoReturn p (node := Fetch)
+        ; if NOT (is_file node) then $RET := -1
+          else
+          (
+             $RET := match node with File(s) -> s[i]
+             ; posix_fds(fd) := (p,i+1)
+          )
+        ; Unset [p;i;node]
+      )
+
+  This has two subcases, one where it fails and one where it succeeds:
+  
+  Subcase Fail:
+  
+    <H,F,wp,read e> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+    
+    There are two ways this can happen:
+    1. The evaluation of e is not in the domain of H(posix_fds).
+
+      This case is trivial and looks the same as the Close failure.
+
+    2. The path the fd points to is not a File.
+
+      (* TODO: This is only clear if GoDoReturn e c doesn't change the
+               zipper when c doesn't change the zipper, which is true,
+               but needs to be proven *)
+               
+      Then, <E,z,c> ->* <E',z,c'>
+      where c' = if NOT (is_file node) then $RET := -1
+                   else
+                   (
+                      $RET := match node with File(s) -> s[i]
+                      ; posix_fds(fd) := (p,i+1)
+                   )
+                 ; Unset [p;i;node]
+      And E' = E[p |-> fst E(posix_fds)(fd)]
+                [i |-> snd E(posix_fds)(fd)]
+                [node |-> F(p)]
+        where fd is the evaluation of e.
+      And, <E',z,c'>     -> <E',z,$RET := -1; Unset [p;i;node]>
+                    -(-1)-> <E'[$RET |-> -1],z,Unset [p;i;node]>
+                         -> <E[$RET |-> -1],z,Skip>
+      Which is related by R with <H[$RET |-> -1],F,wp,Skip> and the
+      observations are identical.
+
+  Subcase Success:
+
+    <H,F,wp,read e> -s[i]-> <H',F,wp,Skip>
+    where H' = H[posix_fds(fd) |-> (p,i+1)]
+                [$RET |-> s[i]]
+      where fd is the evaluation of e
+      and   (p,i) = H(posix_fds)(fd)
+      and   File(s) = F(p)
+
+    Since, fd is in the domain of H(posix_fds) it must also be in
+    E(posix_fds). Since the path points to a file, it must do the same
+    in the zipper. Thus:
+
+    <E,z,c>   ->* <E',z,c'>
+    where c' = $RET := match node with File(s) -> s[i]
+               ; posix_fds(fd) := (p,i+1)
+               ; Unset [p;i;node]
+    And E' = E[p |-> fst E(posix_fds)(fd)]
+              [i |-> snd E(posix_fds)(fd)]
+              [node |-> F(p)]
+      where fd is the evaluation of e.
+
+    Then, <E',z,c'> -s[i]-> <E'',z,c''>
+    where c'' = posix_fds(fd) := (p,i+1); Unset [p;i;node]
+    And   E'' = E'[$RET |-> s[i]]
+    And   File(s) = E'(node)
+          <E'',z,c''>    -> <E''',z,Unset[p;i;node]> -> <E'''',z,Skip>
+    where E''' = E''[posix_fds(fd) |-> (p,i+1)]
+    And   E'''' = E[posix_fds(fd) |-> (p,i+1)]
+                   [$RET |-> s[i]]
+
+    Since <H',F,wp,Skip> R <E'''',z,Skip> and the observations are
+    identical, the subcase holds.
+
+  Since both subcases hold, this case holds.
+
+Case pc = readdir e:
+
+  This case is the same as read except that the File must be a directory.
+
+Case pc = write e1 e2:
+
+  (* TODO: This seems a bit handwavy, I think I need to formally
+     define the bijection from z <-> (F * wp) *)
+
+  c = [| write |] e1 e2
+    = if contains posix_fds e1 then $RET := -1
+      else
+      (
+        (p,i) := posix_fds(e1)
+        ; GoDoReturn (dirname p)
+        (
+          if Has_child (basename p)
+          then
+          (
+            GotoChild (basename p)
+            ; node = Fetch
+            ; if NOT (is_file node) then $RET := -1
+              else
+              (
+                new_node :=
+                  match node with File(s') ->
+                    File(replace_string_from s' i e2)
+                ; Update new_node
+                ; posix_fds(e1) := (p,i + (len e2))
+                ; $RET := 0
+              )
+            ; Up
+          )
+          else
+          (
+            if i <> 0 then $RET := -1
+            else
+            (
+              Add_child (basename p) (File e2)
+              ; posix_fds(e1) := (p,len e2)
+              ; $RET := 0
+          )
+        )
+        ; Unset [p;i;node;new_node]
+      )
+
+  This has two subcases, one where it fails and one where it succeeds:
+  
+  Subcase Fail:
+
+    <H,F,wp,write e1 e2> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+    
+    There are three ways this can happen:
+    1. The evaluation of e is not in the domain of H(posix_fds).
+
+      This case is trivial and looks the same as the Close failure.
+
+    2. The path the fd points to is a directory.
+
+      This case is a bit more difficult, but almost identical to the
+      2nd Read failure subcase.
+
+    3. The path the fd points to is empty, but the index of the fd is
+       not 0.
+               
+      Then, <E,z,c> ->* <E',z,c'>
+      where c' = if i <> 0 then $RET := -1
+                 else
+                 (
+                   Add_child (basename p) (File e2)
+                   ; posix_fds(fd) := (p,len e2)
+                   ; $RET := 0
+                 )
+                 ; Unset [p;i;node;new_node]                  
+      And E' = E[p |-> fst E(posix_fds)(fd)]
+                [i |-> snd E(posix_fds)(fd)]
+        where fd is the evaluation of e1.
+      And, <E',z,c'>     -> <E',z,$RET := -1; Unset [p;i;node;new_node]>
+                    -(-1)-> <E'[$RET |-> -1],z,Unset [p;i;node;new_node]>
+                         -> <E[$RET |-> -1],z,Skip>
+      Which is related by R with <H[$RET |-> -1],F,wp,Skip> and the
+      observations are identical.
+      
+      Note that since node and new_node are fresh in E, unsetting them
+      does nothing.
+
+  Subcase Success:
+
+    There are two ways to succeed:
+
+    1. A file already exists at the location pointed to by the fd
+    
+      <H,F,wp,write e1 e2> -0-> <H',F',wp,Skip>
+      where H' = H[posix_fds(fd) |-> (p,i+|s|)]
+                  [$RET |-> 0]
+      and F' = F[p |-> File(s'[i] := s)]
+        where fd is the evaluation of e1
+        and   s  is the evaluation of e2
+        and   (p,i) = H(posix_fds)(fd)
+        and   File(s') = F(p)
+
+      Since, fd is in the domain of H(posix_fds) it must also be in
+      E(posix_fds). Sine the path points to a file, it must do the same
+      in the zipper. Thus:
+      
+      <E,z,c>   ->* <E',z',c'>
+      where c' = new_node :=
+                   match node with File(s') ->
+                     File(replace_string_from s' i e2)
+                 ; Update new_node
+                 ; posix_fds(e1) := (p,i + (len e2))
+                 ; $RET := 0
+                 ; Up
+                 ; Goto p'
+                 ; Unset [p;i;node;new_node]
+        where p' is the computed anti-path of dirname p w.r.t. z
+      And z' is the transformation of F with working-path p.
+      And E' = E[p |-> fst E(posix_fds)(fd)]
+                [i |-> snd E(posix_fds)(fd)]
+                [node |-> F(p)]
+        where fd is the evaluation of e1.
+      
+      Then, <E',z',c'> ->3 <E'',z'',c''> 
+      where ->3 takes three steps
+      And   c'' = $RET := 0
+                  ; Up
+                  ; Goto p'
+                  ; Unset [p;i;node;new_node]
+        where p' is the computed anti-path of dirname p w.r.t. z
+      And   E'' = E'[new_node |-> File(s'[i] := s')]
+                    [posix_fds(fd) |-> (p,i + |s|)]
+      And   z'' is the transformation of F[p |-> File(s'[i] := s)]
+                with working-path p. 
+        where   File(s') = E'(node)
+        and     s is the evaluation of e2
+        and     fd is the ealuation of e1
+        
+            <E'',z'',c''> -0-> <E''',z'',Up;Goto p';Unset[p;i;node;new_node]> 
+      where E''' = E''[$RET |-> 0]
+
+            <E''',z'',Up;Goto p';Unset[p;i;node;new_node]> ->* <E'''',z''',Skip>
+      where E'''' = E[posix_fds(fd) |-> (p,i+|s|)]
+                     [$RET |-> 0]
+      and z''' is is the transformation of F[p |-> File(s'[i] := s)] = F'
+                with working-path wp
+        where fd is the evaluation of e1
+        and   s  is the evaluation of e2
+        and   (p,i) = H(posix_fds)(fd)
+        and   File(s') = F(p)
+
+      Since <H',F',wp,Skip> R <E'''',z''',Skip> and the observations are
+      identical, the subcase holds.
+
+    2. Nothing exists at the location pointed to by the fd and i is 0
+
+      <H,F,wp,write e1 e2> -0-> <H',F',wp,Skip>
+      where H' = H[posix_fds(fd) |-> (p,|s|)]
+                  [$RET |-> 0]
+      and F' = F[p |-> File(s)]
+        where fd is the evaluation of e1
+        and   s  is the evaluation of e2
+        and   (p,0) = H(posix_fds)(fd)
+        and   NOT (p in dom(F))
+
+      Since, fd is in the domain of H(posix_fds) it must also be in
+      E(posix_fds). Sine the path is empty, it must also not exist
+      in the zipper. Thus:
+      
+      <E,z,c>   ->* <E',z',c'>
+      where c' = Add_child (basename p) (File e2)
+                 ; posix_fds(e1) := (p,len e2)
+                 ; $RET := 0
+                 ; Goto p'
+                 ; Unset [p;i;node;new_node]
+        where p = E'(p)
+        and   p' is the computed anti-path of dirname p w.r.t. z
+      And z' is the transformation of F with working-path (dirname p).
+      And E' = E[p |-> fst E(posix_fds)(fd)]
+                [i |-> snd E(posix_fds)(fd)]
+        where fd is the evaluation of e1.
+        and   E'(i) = 0
+      
+      Then, <E',z',c'> ->2 <E'',z'',c''> 
+      where ->2 takes two steps
+      And   c'' = $RET := 0
+                  ; Goto p'
+                  ; Unset [p;i;node;new_node]
+        where p' is the computed anti-path of dirname p w.r.t. z
+      And   E'' = E'[posix_fds(fd) |-> (p,|s|)]
+      And   z'' is the transformation of F[p |-> File(s)]
+                with working-path dirname p. 
+        where s is the evaluation of e2
+        and   fd is the ealuation of e1
+        
+            <E'',z'',c''> -0-> <E''',z'',Goto p';Unset[p;i;node;new_node]> 
+      where E''' = E''[$RET |-> 0]
+
+            <E''',z'',Goto p';Unset[p;i;node;new_node]> ->* <E'''',z''',Skip>
+      where E'''' = E[posix_fds(fd) |-> (p,|s|)]
+                     [$RET |-> 0]
+      and z''' is is the transformation of F[p |-> File(s)] = F'
+                with working-path wp
+        where fd is the evaluation of e1
+        and   s  is the evaluation of e2
+        and   (p,0) = H(posix_fds)(fd)
+
+      Since <H',F',wp,Skip> R <E'''',z''',Skip> and the observations are
+      identical, the subcase holds.
+
+    Since both subsubcases hold, this subcase holds.
+
+  Since both subcases hold, this case holds.
+  
+Case pc = remove e:
+
+  c = [| remove |] e
+    = GoDoReturn (dirname e)
+      (
+        if NOT (Has_child (basename e)) then $RET := -1
+        else
+        (
+          GotoChild (basename e)
+          ; if Is_folder AND Fetch <> Dir([]) then $RET := -1
+            (* Can only remove empty dirs *)
+            else
+            (
+              Up
+              ; Remove_child (basename e)
+              ; $RET := 0
+            )
+        )
+      )
+
+  This has two subcases, one where it fails and one where it succeeds:
+  
+  Subcase Fail:
+
+    <H,F,wp,remove e> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+    
+    There are two ways this can happen:
+    1. The evaluation of e is not in the domain of F.
+    2. The evaluation of e points to a non-empty directory.
+
+       Both cases are quite easy to show.
+       (* TODO: I can do this if we want to work it out *)
+
+
+  Subcase Success:
+
+    <H,F,wp,remove e> -0-> <H',F',wp,Skip>
+    where H' = H[$RET |-> 0]
+    And   F' = F \ p
+      where p is the absolute path that e yields when combined with wp
+
+    If we have no errors, then:
+
+    <E,z,c> ->* <E,z',c'>
+    where c' = Remove_child (basename e); $RET := 0; Goto p'
+      where p' is the computed anti-path of dirname p w.r.t. z
+    And z' is the transformation of F with working path (dirname p)
+      where p is the absolute path that e yields when combined with wp
+
+    <E,z',c'> -> <E,z'',$RET := 0; Goto p'>
+    Where p' is the computed anti-path of dirname p w.r.t. z
+    And z'' is the transformation of F \ p = F' with working path (dirname p)
+      where p is the absolute path that e yields when combined with wp
+
+    <E,z'',$RET := 0; Goto p'> -0-> <E[$RET |-> 0],z'',Goto p'>
+    Where p' is the computed anti-path of dirname p w.r.t. z
+
+    <E[$RET |-> 0],z'',Goto p'> ->* <E',z''',Skip>
+    Where E' = E[$RET |-> 0]
+    And   z''' is the transformation of F \ p = F' with working path wp.
+
+    Since <H',F',wp,Skip> R <E',z''',Skip> and the observations are
+    identical, the subcase holds.
+
+  Since both subcases hold, this case holds.
+
+Case pc = mkdir e:
+
+  c = [| mkdir |] e
+    = GoDoReturn (dirname p)
+      (
+        if Has_child (basename p) then $RET := -1
+        else
+        (
+          addChild (basename p) (Dir [])
+          ; $RET := 0
+        )
+      )
+
+
+  This has two subcases, one where it fails and one where it succeeds:
+  
+  Subcase Fail:
+
+    <H,F,wp,mkdir e> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+    
+    This happens if there is already something at the path that e
+    evaluates to.
+
+    This case is trivial.
+
+  Subcase Success:
+
+    <H,F,wp,mkdir e> -0-> <H',F',wp,Skip>
+    where H' = H[$RET |-> 0]
+    And   F' = F[p |-> Dir([])]
+      where p is the absolute path that e yields when combined with wp
+
+    If we have no errors, then:
+
+    <E,z,c> ->* <E,z',c'>
+    where c' = addChild (basename p) (Dir []); $RET := 0; Goto p'
+      where p' is the computed anti-path of dirname p w.r.t. z
+    And z' is the transformation of F with working path (dirname p)
+      where p is the absolute path that e yields when combined with wp
+
+    <E,z',c'> -> <E,z'',$RET := 0; Goto p'>
+    Where p' is the computed anti-path of dirname p w.r.t. z
+    And z'' is the transformation of F[p |-> Dir([])] = F' with working path (dirname p)
+      where p is the absolute path that e yields when combined with wp
+
+    <E,z'',$RET := 0; Goto p'> -0-> <E[$RET |-> 0],z'',Goto p'>
+    Where p' is the computed anti-path of dirname p w.r.t. z
+
+    <E[$RET |-> 0],z'',Goto p'> ->* <E',z''',Skip>
+    Where E' = E[$RET |-> 0]
+    And   z''' is the transformation of F[p |-> Dir([])] = F' with working path wp.
+
+    Since <H',F',wp,Skip> R <E',z''',Skip> and the observations are
+    identical, the subcase holds.
+
+  Since both subcases hold, this case holds.
+
+Case pc = chdir e:
+
+  c = [| chdir |] e
+    = Goto p
+      ; if is_file Fetch
+        then $RET := -1
+        else $RET := 0
+
+  This has two subcases, one where it fails and one where it succeeds:
+  
+  Subcase Fail:
+
+    <H,F,wp,chdir e> -(-1)-> <H[$RET |-> -1],F,wp,Skip>
+
+    This only happens if the targeted path is not a Directory.
+
+    This subcase is trivial to show.
+
+  Subcase Success:
+
+    <H,F,wp,chdir e> -0-> <H',F,wp',Skip>
+    where H' = H[$RET |-> 0]
+    And   wp' is the absolute path that e yields when combined with wp
+
+    If we have no errors, then:
+
+    <E,z,c> ->* <E,z',$RET := 0>
+    And z' is the transformation of F with working path p
+      where p is the evaluation of e
+
+    <E,z',$RET := 0> -0-> <E',z',Skip>
+    Where E' = E[$RET |-> 0]
+    And z' is the transformation of F with working path p
+      where p is the absolute path that e yields when combined with wp
+
+    Since <H',F,wp',Skip> R <E',z',Skip> and the observations are
+    identical, the subcase holds.
+
+  Since both subcases hold, this case holds.
+
+Case pc = pc1;pc2:
+
+  c = [| pc1;pc2 |]
+    = [| pc1 |];[| pc2 |]
+
+  There are two subcases.
+
+  Subcase pc1 = Skip:
+
+    <H,F,wp,Skip;pc2> -> <H,F,wp,pc2>
+
+    And
+    <E,z,Skip;[|pc2|]> -> <E,z,[|pc2|]>
+
+    These are clearly related and there are no observations.
+
+  Subcase pc1 <> Skip:
+
+    If <H,F,wp,pc1> -o-> <H',F',wp',pc1'>
+    then <H,F,wp,pc1;pc2> -o-> <H',F',wp',pc1';pc2>
+
+    Since pc1 is a smaller subterm, we can use the IH.
+    
+    By the induction hypothesis, since <H,F,wp,pc1> R <E,z,[| pc1 |]>
+    , it follows that <E,z,[| pc1 |]> -o->* <E',z',c'>
+    AND <H',F',wp',pc1'> R <E',z',c'> AND [|pc1'|] = c'
+
+    Thus, by definition of multistepping and composition:
+    <E,z,[| pc1 |]; [| pc2 |]> -o->* <E',z',[|pc1'|];[pc2|]>
+    And  <H',F',wp',pc1';pc2> R <E',z',[|pc1'|];[pc2|]>
+
+  Since both subcases hold, this case holds
+
+Case pc = if b then pc1 else pc2:
+
+  This case is trivially true with a straightforward application of
+  the induction hypothesis.
+
+Case pc = Set x:
+
+  This case is trivially true since H = E
+
+
+----------------------------------------
+Zipper vs Zipper -> POSIX
+----------------------------------------
+----------------------------------------
+Zipper vs Zipper -> Storage
+----------------------------------------
+----------------------------------------
+POSIX vs POSIX -> Storage
+----------------------------------------
+
+--------------------------------------------------------------------------------
+Additional Proofs
+--------------------------------------------------------------------------------
+
+----------------------------------------
+Various movement lemmas
+----------------------------------------
+
+(*TODO: In particular, prove that GoDoReturn e c returns the same
+        zipper as long as c does not change the zipper *)
+
+
+--------------------------------------------------------------------------------
+ZIPPER ADDITIONS
+--------------------------------------------------------------------------------
+
+
+----------------------------------------
+Recursion
+----------------------------------------
+
+(* Syntax *)
+
+(*
+   Reduce       : (String -> Tree -> Expression) -> Expression
+   Map          : (String -> Tree -> Tree) -> Command
+   ApplyC       : (String -> Tree -> Command) -> Command
+   ApplyT       : (String -> Tree -> Tree) -> Command
+*)
+Expression e ::= ... | fun x -> e | Reduce e 
+
+Command c ::= ... | Map e | ApplyC e | ApplyT | rec x := e 
+
+(* Semantics *)
+
+Expression Evaluation:
+
+[[ x ]] (E,z) =
+   if E(x) = Closure _
+   then [[E(x)]] (E,z)
+   else E(x)
+
+(* TODO: Not convinced this closure shenanigans works *)
+
+[[ Closure(e,(E,z)) ]] _ = [[e]] (E,z)
+
+
+[[ Reduce e ]] (E,z) =
+   let (name,tree) = z.current in
+   ([[e]] (E,z)) name tree
+   
+
+Commands:
+
+E' = E[x |-> Closure(e,(E,z))]
+-----------------------------
+<E,z,rec x := e> -c-> <E',z,Skip>
+
+(* This is an internal map. Probably there is some better way of doing
+this *)
+
+<E,z, Map f> -c->* <_,downZip,Skip>
+<E,downZip, if Has_next then Next;MapSibs f else Skip> -c->* <_,rightZip,Skip>
+(name,rightT) = rightZip.current
+z' = { downZip with current = (name, f name rightT)}
+-----------------------------
+<E,z,MapSibs f> -c->  <E,z',Skip>
+
+
+f = [[ e ]] (E,z)
+Dir(l) = current_node z
+<E,z, Down;MapSibs f;Up> -c->* <_,z'',Skip>
+(name,t) = z''.current
+z' = {z'' with current = (name,f name t)}
+-----------------------------
+<E,z,Map e> -c->  <E,z',Skip>
+
+f = [[ e ]] (E,z)
+(name, File d) = z.current
+z' = {z with current = (name,f name (File d))}
+-----------------------------
+<E,z,Map e> -c->  <E,z',Skip>
+
+
+f = [[ e ]] (E,z)
+(name,t) = z.current
+c' = f name t
+-----------------------------
+<E,z,ApplyC e> -c->  <E,z,c'>
+
+
+f = [[ e ]] (E,z)
+(name,t) = z.current
+z' = { z with current = (name, f name t)}
+-----------------------------
+<E,z,ApplyT e> -c->  <E,z',Skip>
+
+
+----------------------------------------
+Concurrency Control
+----------------------------------------
+
+(* Syntax *)
+
+Command c ::= ... | Commit | Refresh
+
+(* Semantics *)
+
+TODO, will require addition of a log and a global zipper to context
+
+
+----------------------------------------
+Symlinks
+----------------------------------------
+
+(* Syntax *)
+
+Tree t ::= ... | Symlink (p * t option)  
+Commands c ::= ... | UpdateLink e
+
+(* Helpers *)
+
+get_current_ignore_symlink z =
+   match z.current with
+   | name, Symlink(_,Some t)
+   | name, t                 -> (name,t)
+
+current_node_ignore_symlink z = snd (get_current_ignore_symlink z)
+
+place_into_possible_symlink z t =
+   match z.current with
+   | name,Symlink(p,_) -> (name,Symlink(p,t))
+   | name,t            -> (name,t)
+
+get_path z =
+  match z.current with
+  | _,Symlink (p,_)
+  | name as p, _    ->
+    match z.ancestor with
+    | None -> p
+    | Some z -> absolutify_path z p
+
+(* If the path is absolute already, then we are done.
+   Otherwise we grab the rest of the path from the zipper.
+*)
+
+absolutify_path z p =
+  match p with
+  | "/"
+  | "/" * _ -> p
+  | _ -> (get_path z) * p
+
+(* Expression Evaluation *)
+
+[[ Fetch ]] (_,z) = current_node_ignore_symlink z
+
+[[ Is_folder ]] (_,z) =
+   match current_node_ignore_symlink z with
+   | Dir _ -> true
+   | _     -> false
+
+[[ Has_child ]] e (E,z) =
+   match current_node_ignore_symlink z with
+   | Dir l -> exists ([[e]] (E,z)) l
+
+(* Semantics *)
+
+(* CYCLIC Breaking:
+ * Small example where we break in a cyclic FS.
+ *       /
+ *     A   D
+ *   B   C
+ *
+ *  Where B is a symlink to /. If we perform Down;GotoChild C;Update x
+ *  ;Prev;GotoChild D;Up, then we lose the update 
+ *
+ * - This particular issue seems solved by a GoDoReturn where we keep
+ *   the zipper instead of Goto (in Down/Next/Prev).
+ *   Where do we lose if we do that?
+ * - I think going back to the regime where Prev/Next = Up;GotoChild X
+ *   also would solve it?
+ *)
+ 
+(* NOTE: We break in a circular chain of symlinks. This is a
+ * reasonable failing. Normal FSes quit after some set number of hops
+ * and report too many symlinks. *)
+
+(* NOTE: Symlink paths are relative to their parents *)
+
+Dir((name,_) :: _)  = current_node_ignore_symlink z
+--------------------------------- Down
+<E,z,Down> -c-> <E,z,GotoChild name>
+
+
+s = [[e]] (E,z)
+Dir(left @ (s,Symlink (p,_)) :: right) = current_node_ignore_symlink z
+ancestor = {z with current = place_into_possible_symlink z Dir([])}
+<E,z,Goto (absolutify_path z p)> -c->* <E,z'',Skip>
+z'  = {ancestor = Some ancestor;
+       left = reverse left;
+       right; 
+       current = (s,Symlink (p,Some (current_node_ignore_symlink z'')))}
+--------------------------------- GC-to-Symlink
+<E,z,GotoChild e> -c-> <E,z',Skip>
+
+s = [[e]] (E,z)
+Dir(left @ (s,t) :: right)  = current_node_ignore_symlink z
+t <> Symlink _
+ancestor = {z with current = place_into_possible_symlink z Dir([])}
+z' = {ancestor = Some ancestor;
+      left = reverse left;
+      right; 
+      current = (s,t)}
+--------------------------------- GC-Normal
+<E,z,GotoChild e> -c-> <E,z',Skip>
+
+
+Some(ancestor) = z.ancestor
+Symlink(p,Some (Dir [])) = current_node ancestor
+t = Dir(reverse z.left @ (z.current :: z.right))
+z' = { ancestor with current = place_into_possible_symlink ancestor t}
+c = x <- Fetch;GoDoReturn (absolutify_path z' ".") (Update x)
+--------------------------------- Up-to-Symlink
+<E,z,Up> -c-> <E,z',c>
+
+where x is fresh/
+
+Some(ancestor) = z.ancestor
+current_node ancestor <> Symlink _
+(name, Dir []) = ancestor.current
+t = Dir(reverse z.left @ (z.current :: z.right))
+z' = { ancestor with current = (name,place_into_possible_symlink z t)}
+--------------------------------- Up-Normal
+<E,z,Up> -c-> <E,z',Skip>
+
+
+current :: right = z.right
+snd current <> Symlink _
+z' = {z with
+      left = z.current :: z.left;
+      right;
+      current}
+--------------------------------- Next-Normal
+<E,z,Next> -c-> <E,z',Skip>
+
+(name,Symlink (p,_)) :: right = z.right
+Some(ancestor) = z.ancestor
+<E,z,Goto (absolutify_path ancestor p)> -c->* <E,z'',Skip>
+z' = {z with
+      left = z.current :: z.left;
+      right;
+      current = (name, Symlink (p,Some (current_node_ignore_symlink z'')))}
+--------------------------------- Next-to-Symlink
+<E,z,Next> -c-> <E,z',Skip>
+
+(* Prev is symmetric to Next *)
+
+Symlink(p,_) = current_node z
+t = [[e]] (E,z)
+-----------------------------
+<E,z,Update e> -c-> <E,z,GoDoReturn (absolutify_path z ".") (Update t)>
+
+
+current_node z <> Symlink _ 
+-----------------------------
+<E,z,Update e> -c-> <E,z,UpdateLink e>
+
+(name,_) = z.current
+t = [[e]] (E,z)
+z' = {z with current = (name,t)}
+-----------------------------
+<E,z,UpdateLink e> -c-> <E,z',Skip>
+
+
+--------------------------------------------------------------------------------
+OLD PERSISTENT STORAGE (TODO: Update)
+--------------------------------------------------------------------------------
+
+(* Requirements *)
+
+1. Needs to be persistent and have read and write abstractions
+   basically (and different 'positions' to denote where different data
+   is). Also a way to create new 'positions'.
+
+2. For transaction issues to pop up, different users need to see each
+   others changes. So we need to actually have it in the context
+   instead of just as some abstract thing living elsewhere. Or maybe
+   we can get away with having the positions have some version and
+   then we can talk about the version the user should get vs the one
+   they do get.
+
+3. For nice copy-on-write, we need to be able to put one position in
+   multiple nodes and a way to mark them unmutable at a location (so
+   we know to make a new one if we change it).
+
+4. For hard links, we'd like to be able to put one position in
+   multiple nodes, and some way to check if the data is dirty when we
+   navigate to a node (maybe we can use the transactional log for
+   this?)
+
+5. For data-sharing, maybe we need an entirely different mechanism?
+   Basically, we want it to be the case that if one zipper grabs a
+   node, every other zipper that navigates there can just use the same
+   one. Not sure how explicitly we wanna model this...
+
+6. For serializability, we need different users to be unable to affect
+   one another until after commits.
+--- We can make changes to the storage immediately and just take
+    care of this entirely with conflicts (although conflict detection
+    becomes more of a hassle)
+--- We can play some snapshot/versioning type of game.
+--- We can have a swap space where we put changes until we commit a
+    transaction, at which point it becomes visible to the world (making
+    conflicts easy since we just compare commit time stamp to start
+    time stamp, or even better, the specific path time stamp).
+
+7. For durability, probably we need to store some transaction log on
+   the persistent storage.
+
+8. Hopefully we can abstract away writing to specific bit segments and
+   creating a new position if the position can't hold the data we
+   write to it and put that work somewhere else. Maybe not though.
+
+(* Notes *)
+
+Requirement 1 means we need to have an API with 'read','write', and
+'create'. The first two take 'positions' as an argument, and create
+creates a new one. Positions are basically inodes, so we'll just call
+them that.
+
+Requirement 2 means we probably want a map in the context from Inodes
+to data (which means we can define read, write, and create ourselves
+too), which can change behind our back.
+Or read values need to come with some sort of globally-ordered
+version, which a users zipper can also come with, and that way it'll
+be clear if the version is before or after the zipper was started
+(thus modeling interference).
+
+Requirement 3 means nodes should have some 'mutability' bit. Although
+maybe both nodes need to be immutable until either is written to,
+which is a bit odd.
+
+And Requirement 4 suggests that the underlying storage should have
+some, quickly accessed, dirty bit. Depending on how we model
+data-sharing, we may be able to include the dirty bit in the system
+dealing with that (so we don't have to go to some slow storage). Or,
+we could have an additional mapping from inodes to values, that tell
+us we should get that value forevermore in this transaction (unless we
+overwrite it).
+
+Requirement 6 is probably where most of our choices come in. I'd say
+the versioning world makes sense if we want snapshot isolation,
+because then it is quite straightforward. If we want full
+serializability, then the swap space move makes more sense, but is
+more difficult. 
+
+
+Remaining questions:
+- What do we do for data sharing?
+- Which option do we want to use for Req 6?
+- Do we want to formally include some offloading mechanism, so we
+  don't use ever-growing amounts of memory?
+
+(* TODO: Handle/model various failures, like out of disk *)
+
+(* TODO: Consider building in laziness... Nice for things like node
+   copying, just writing, etc. *)
+
+(* TODO: Remember that when we add in transactions, we want them to
+   fail/restart if we try to write to an inode with a newer TS than
+   the transaction, or we do these checks at commit-time *)
+
+(* TODO: Do we care much about the fact that underlying storage is
+   actually some bitstring? *)
+
+(* Disk API *)
+
+(* 'read inode ts' returns the Node stored in the given inode,
+   prior to version ts *)
+read  : Inode -> Timestamp -> Node
+
+(* 'write string to' writes 'Node' to the inode 'to', and can maybe fail? *)
+write : Node -> Inode -> bool
+
+(* create returns a new Inode *)
+create : unit -> Inode
+
+(* Since you can copy multiple times, we really want there to be an
+   internal 'copies' counter. If it is 0, then check_cow returns true,
+   else false. Unset decrements and set increments *)
+
+check_cow : Inode -> bool
+
+set_cow   : Inode -> bool
+unset_cow : Inode -> bool
+
+(* World API *)
+
+(* next_ts gives the globally next timestamp *)
+next_ts : unit -> Timestamp
+
+(* Syntax *)
+
+(* Update : NodeExpression -> Command *)
+
+Node n ::= Dir of (s * t) list | File of d
+
+Tree t ::= Inode * Node option
+
+Commands c ::= ... | Set_CoW
+
+(* Helper functions *)
+
+name_and_node : Zipper -> string * Node
+current_node : Zipper -> Node
+
+replace_node : Zipper -> Node -> Zipper
+
+(* Semantics *)
+
+IMap : Inode -> Node
+
+Context: Env * Zipper * Timestamp * IMap 
+
+(* Movement *)
+
+Dir((name,_) :: _) = current_node z
+--------------------------------- Down
+<E,z,ts,imap,Down> -c-> <E,z,ts,imap,GotoChild name>
+
+
+s = [[e]] (E,z)
+Dir(left @ (s,(i,None)) :: right) = current_node z
+ancestor = replace_node z Dir([])
+n' = read i ts
+z' = {ancestor = Some ancestor;
+      left = reverse left;
+      right; 
+      current = (s,(i,Some n'))}
+--------------------------------- GC-New
+<E,z,ts,imap,GotoChild e> -c-> <E,z',ts,imap,Skip>
+
+
+s = [[e]] (E,z)
+Dir(left @ (s,(i,Some n)) :: right) = current_node z
+ancestor = replace_node z Dir([])
+n' = if i in imap then imap(i) else n
+z' = {ancestor = Some ancestor;
+      left = reverse left;
+      right; 
+      current = (s,(i, Some n'))}
+--------------------------------- GC-Old
+<E,z,ts,imap,GotoChild e> -c-> <E,z',ts,imap,Skip>
+
+(* Note that we never need to rewrite a directory inode unless we
+   Update it, so Up doesn't need to change interestingly. This is
+   because the inodes below it can't have changed, though their
+   contents may have *)
+
+(name,(i,None)) :: right = z.right
+n' = read i ts
+z' = {z with
+      left = z.current :: z.left;
+      right;
+      current = (name,(i, Some n'))}
+--------------------------------- Next-New
+<E,z,ts,imap,Next> -c-> <E,z',ts,imap,Skip>
+
+
+(name,(i,Some n)) :: right = z.right
+n' = if i in imap then imap(i) else n
+z' = {z with
+      left = z.current :: z.left;
+      right;
+      current = (name,(i, Some n'))}
+--------------------------------- Next-Old
+<E,z,ts,imap,Next> -c-> <E,z',ts,imap,Skip>
+
+(* Prev is symmetric *)
+
+(* Updates *)
+
+(name,(i,_)) = z.current
+n = [[e]] (E,z)
+NOT (check_cow i)
+write n i
+imap' = imap[i |-> n]
+z' = {z with current = (name,(i, Some n))}
+----------------------------- Update-No-CoW
+<E,z,ts,imap,Update e> -c-> <E,z',ts,imap',Skip>
+
+
+(* TODO: Ugh, this invalidates our previous assumption that Inodes can't
+   change out from under us, which means we need to write the inode of a
+   directory everytime we move upwards... Or, we add another level of
+   indirection! *)
+
+(name,(i,_)) = z.current
+n = [[e]] (E,z)
+check_cow i
+unset_cow i
+i' = create ()
+write n i'
+z' = {z with current = (name,(i', Some n))}
+----------------------------- Update-CoW
+<E,z,ts,imap,Update e> -c-> <E,z',ts,imap,Skip>
+
+
+Dir(children) = current_node z
+n = [[e2]] (E,z)
+i = create ()
+write n i
+t' = Dir(([[e1]] (E,z),(i,Some n)) :: children)
+-----------------------------
+<E,z,ts,imap,Add_child e1 e2> -c-> <E,z,ts,imap,Update t'>
+
+
+(_,(i,_)) = z.current
+set_cow i
+-----------------------------
+<E,z,ts,imap,Set_CoW> -c-> <E,z,ts,imap,Skip>

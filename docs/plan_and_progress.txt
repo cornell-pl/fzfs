@@ -1,0 +1,70 @@
+Possible Paths of Progress:
+- Connect to the actual file system
+-- Exactly what it sounds like, and clearly something we need to do
+-- CAUTION: We need to make sure that we keep using the functional sharing
+   aspects of the zipper as much as possible even as we move onto the
+   real FS
+   
+- Add 2PC to allow distribution and transactionality to work
+  simultaneously
+-- Again, seems like one of those things that needs to happen 
+
+- Persist computations and checkpointing
+-- The naïve version of this is probably writing the zipper out to
+   persistent storage at every step.
+-- A better version would be persisting the global zipper (which
+   would have to be the case if we connect it to a file system anyway)
+   and a log of changes or something.
+
+- Make a more deeply typed FS/Allow built-in data inspection
+-- By using things like pads/forest, and the ability of the zipper to
+   traverse generic data, we could give useful types to our FS, and
+   even allow users to navigate within data as easily as through the
+   rest of the FS
+
+- Provide a computation API
+-- This would more or less be the extension we were talking about
+   earlier, where we distribute pretty generic computations or data,
+   except that the data has to be the underlying FS.
+
+- Functional sharing
+-- 
+
+- "Smart sharing"
+-- Oleg's ZFS has a way to represent an infinite file system. I'm not
+   sure if this falls out from our implementation as I haven't tried
+   it, but since we want to connect this to a real file system, I'm
+   unconvinced this is good to have anyway?
+
+
+Current state of the system:
+- Multi-client, Zipper-based FS
+-- We have an in-memory, functional, zipper-based file system, which
+   offers a each user their own view of the FS until they choose to
+   synchronize with the global zipper
+
+- Distribution:
+-- We can start up a variety of shards (possibly on different hosts)
+and connect them to each other to make one cogent file system.
+-- This distribution is transparent (in the systems sense... So maybe
+   opaque as we think of it? The user doesn't see it) to the user
+
+- Transactionality:
+-- Not only do we give each user a private view of the FS, but as they
+   traverse through the zipper any reads and writes are automatically
+   logged and considered part of a transaction until they either
+   abort, returning to the global state, or attempt to commit.
+
+-- We may be able to get a better sense of precisely what nodes we
+   touch due to the traversal mechanic, which could allow efficient,
+   yet fine-grained concurrency control.
+
+Notes:
+- Actually, since I haven't done 2PC yet we currently have either
+  distribution or transactionality
+
+- The current state is based on the previous version, if we want to
+  keep building on this one, then we are a bit farther back.
+  I think it's probably still worth it because it seems to be a much
+  cleaner design and will make multi-host distribution easier.
+  I'm open to either though.

@@ -1,0 +1,18 @@
+Normal single-threaded zipper
+
+<E,Z,c> - single -> <E,Z,c>
+
+T - A tree that encapsulates the global state of the file system.
+L - A global timestamped log of writes that have been performed to paths in T
+
+Concurrent, multi-threaded execution:
+  <T,L,procs> - multi -> <T',L',procs>
+
+And we can write down the concurrent execution uniformly, calling out to the single-thread semantics as a black box.
+
+  <EI,ZI,cI> - single -> <EI',ZI',cI'>
+  ------------------------------------------------------------------------------------
+  <T,L,{(id1, L1, E1, Z1, c1), ..., (idI, EI, ZI, cI), ..., (idN, EN, ZN, cN)}> - multi ->
+  <T,L,{(id1, E1, Z1, c1), ..., (idI, EI', ZI', cI'), ..., (idN, EN, ZN, cN)}> 
+
+And then something special happens when we commit.

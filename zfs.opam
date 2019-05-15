@@ -1,0 +1,12 @@
+opam-version: "1.2"
+version: "0.1"
+maintainer: "dilorenzo@cs.cornell.edu"
+authors: ["Jonathan DiLorenzo"]
+homepage: "https://github.com/cornell-pl/ocaml-zfs"
+bug-reports: "https://github.com/cornell-pl/ocaml-zfs/issues"
+dev-repo: "https://github.com/cornell-pl/ocaml-zfs"
+license: "None"
+build: [
+  ["jbuilder" "build" "--only" "zfs" "--root" "." "-j" jobs "@install"]
+]
+build-test: [["jbuilder" "runtest" "-p" name "-j" jobs]]

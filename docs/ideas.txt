@@ -1,0 +1,509 @@
+========================================================================
+USING RPC PARALLELL:
+========================================================================
+
+- How can we use simple start_app? (To start at least, until I get
+  more familiar with RPC_parallel)
+-- Start needs a tree description to construct a tree and a command
+  (to run start_app)
+-- Or have a start that is just start app and a distribute, which
+  actually does the distribution?
+
+- Make a connection handler (So that people can open new connections
+  to hubs, although they won't be able to call arbitrary functions...)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+========================================================================
+PLAUSIBLE THEORETICAL(ish) IMPROVEMENTS/TODO
+========================================================================
+Thoughts:
+Adding symbolic links:
+- Points to a path
+-- Not so natural for the zipper since it would have to navigate to
+that path instead of the pointed-to term being right there...
+- Every term is a reference, so the link just contains the relevant
+reference
+-- Every term being a reference is super gross
+- Just make it contain a normal functional term
+-- Now a term can have multiple parents, so updating is quite
+difficult. In particular, because how do we know about parents we
+didn't come from. We would need the term to contain some list of
+parents I guess?
+-- Seems pretty gross
+
+If we had a typed FS (ala Forest), how would that affect navigation?
+
+
+========================================================================
+PLAUSIBLE PRACTICAL IMPROVEMENTS/TODOS
+========================================================================
+Ideas:
+- Probably should used typed TCP rather than normal TCP since that
+seems to be what I'm doing anyway.
+- Make a command type?
+
+
+Testing:
+- Try using absolute paths (with Cd for now, but soon in general after
+fixed)
+- Test next, prev, up, and down and figure out how to fix
+- Test all commands on list
+- Test prompts (After trying to fix prompts)
+- Make sure zipper+log are stored properly for correct commands
+
+Next steps:
+- Fix next, prev, up, and down
+- Properly store zipper+log after running command (try cd ../../d2
+from d1/d11)
+- Probably need to pass an id to Move
+-- Consider storing id in zipper?
+
+- Almost certainly will need a perId mutex disallowing clients to do
+multiple things at the same time in different places and causing bad errors
+USE Marshal.No_sharing
+
+BUG FIXES:
+- Make absolute paths work properly in commands that aren't 'cd'
+- Fix prompt for "cp d1/d11 ." (Shouldn't writeR in perform command
+after that...)
+- "cd /" doesn't update zipper properly
+- Nor "cd ../../../d2" (in d1/d11/d111) (Fix cd updating shard zipper)
+- Prompts don't work properly in presence of refresh (basically,
+shards don't properly change to not Master, as is reasonable)
+- WTF is going on with moving and not properly removing stuff
+- You broke everything when you updated move....
+
+Things that are gonna go wrong:
+- Zippers are gonna be in the wrong place at different shards
+- Not gonna update them when they need updating
+
+DONE:
+- Add shard when a new server connects
+- Write start_shard function
+- Fix commands to use writeC and deal with shards properly
+- Control passing
+- Fixed Cp and making node
+- Made copying and rmving fail for shards
+- Sent quits along properly
+
+FIXES:
+- Fixed shards going down gracefully
+- Fixed term marshaling
+
+Possible examples:
+- Map Reduce
+-- Compute frequency index on words in files
+--- Using ls and cd
+- Traverse
+-- Compute frequency index on words in files
+--- Using ls, down, next, and up?
+- Manually deep copy (or move?) files from one place to another?
+-- Using cp, mkdir, (mv/rm?)
+
+- UNEXERCISED COMMANDS:
+-- echo, touch, mkdir, cp, mv, rm, prev (I guess)
+
+========================================================================
+Random design thoughts
+========================================================================
+
+If we wanted to allow multiple clients to interact with the same
+distributed data, then we need a zipper for each one and maybe we'd
+just have an id that people send along to determine which data that
+client is connecting to (with proper copy on write etc presumably)
+
+It seems like where we're going with this we both represent a tree of
+computations and a tree of data (well, usually one or the other at a
+particular instance)
+
+========================================================================
+API/Usage
+========================================================================
+
+How to run:
+1. User starts a set of nodes (maybe one master and the rest not, or
+maybe all the same)
+2. User connects a client to master (or any) node
+3. Client runs some start function, which distributes data on their
+behalf
+-- Maybe getting a key for their data so other clients could
+   connect and see the same stuff?
+-- OR: Master is started with the data known?
+4. Client runs a compute function, that lets them specify the function
+each shard should run (from 'a tree -> 'b I guess?)?
+-- OR: How do they distinguish between wanting to map over every node?
+--- Maybe instead they give some master function starting at wherever
+they are and traversing tree and doing computations and they are
+automatically distributed?
+5. Result is possibly returned? Maybe they have to supply an
+aggregation?
+
+Compute function could be:
+- Operation at node (Leaf vs Node)?
+-- Including base traversal operations and whatnot?
+-- Prefer not to require them to handle the distribution, unless we
+let them do someething over shard too, but not obvious.
+-- Maybe allow some flag for 'This op can continue independently when
+it hits a shard boundary'?
+--- Not obvious how to actually program such a thing..
+
+========================================================================
+Basic Example
+========================================================================
+
+High level:
+- Aggregate number of errors (or some other statistic) of a bunch of
+log files
+- Each log file on a different Atlas node
+- Send the computation out to all of the nodes
+
+Details:
+- Preprocessing:
+-- Place log files appropriately at each node
+-- Start a server at each node (either all the same, or one master and
+   a bunch of slaves)
+- Run user application
+-- Connect to local node
+-- Call 'start' function at local node, passing in a list of paths
+   (path/server pairs?) and/or a list of servers
+--- Probably make server list optional and let node use the servers it
+    knows about or, if you do paths, use path/server pair list.
+-- Node creates an ID for this computation and sends info to all these
+   servers about the path they should be concerned about
+--- Probably they shouldn't load it for now since this might depend on
+    query?
+-- User app traverses the computation tree and sends the appropriate
+   computation (Send Computation)
+(*
+match node with
+| Node (map) ->
+       Send comp to all in map in parallel
+       Wait for responses
+       Sum responses
+       Send_response parent
+| Leaf (string) ->
+       String.split_lines string |>
+       List.fold (fun acc str ->
+       if String.contains "ERROR"
+       then acc+1
+       else acc) ~init:0
+       |> Send_response parent
+
+Parent needs to be place query comes from, unless client is sort of a
+fake root of the tree (and even then that doesn't exactly
+work... Bares thinking about)
+*)
+--- Start at local node.
+--- Have it move to all of its sub-nodes in parallel
+---- Maybe we export some functions on nodes that say 'Do x in
+     parallel on all children'? Only if they are different shards?
+--- Run  on those nodes
+---- This part at least is straightforward...
+--- Wait for results
+---- How would we collect the results from this? Is there a separate
+     'Capture results from subnodes' thing?
+--- Aggregate
+--- Send response back
+---- Not obvious how to know where to send response back to.
+     Where it came from should work OK though.
+--- This seems to amount to 'Send a computation to all subshards, do
+     computation on all of your children, wait for results to come
+     back from subshards (somehow? Some result datastructure?),
+     aggregate appropriately, send result back.
+
+Consequences:
+- NU: Servers should keep around a list of servers they know
+- U: Servers need to supply a start function (this should basically be an
+     RPC call?)
+-- May be worth just using ocaml-rpc (Mirage) for this purpose
+-- Probably we should supply a library with types of all the functions
+   we export, and you just create a value of that type and send it to the server
+- U: Servers load whatever file they're passed
+-- In fact, we can just have the 'master' node use the Start function
+   for this
+--- Might require some identifier trickery, but should be fine.
+- U: We probably want one or more special functions that do things in
+     parallel if children are shards and sequentially o.w. (or
+     outsource to worker threads/processes even locally o.w.?!)
+-- This may depend on how sending a computation works
+-- U: Design a method to wait for results from such a function (this
+      can just be Deferred.all or something I think)
+- U: And of course the key challenge, how the hell do we send a computation?!      
+-- Maybe we can have them always be match statements on nodes?
+--- So then they need to supply a function on 'a and a function on a
+    map of nodes?
+--- If we know these are the inputs, could we do something easier?
+    Like, code with special holes that get filled?
+--- Compile asts that are sent to us for workers to be run and somehow
+    send them the appropriate information?
+---- If we started the fork we should be able to share memory? Not
+     100% sure how to actually do this though.
+--- Or can we call the interpreter from OCaml? (Not that I can find..)
+
+-- Could we express this with some small number of primitives that we
+   implement? Seems non-ideal...
+   
+    
+
+NU = Non-urgent for first example
+
+
+========================================================================
+2PC
+========================================================================
+
+Commit comes into anyone, they send to coordinator (unless they are
+coordinator), then:
+
+Shard 1                  Coordinator             Shard 2
+               Prepare                 Prepare
+             <----------              --------->
+Write abort                                      Write abort
+or prepare                                       or prepare
+log message                                      log message
+               Yes/No                   Yes/No
+             ---------->              <---------
+                         All Yes:
+                         -Write commit
+                         Else:
+                         -Write abort
+             Commit/Abort             Commit/Abort
+             <-----------             ----------->
+Write abort                                      Write abort
+or commit                                        or commit
+                 Ack                     Ack
+              --------->              <--------
+Abort/commit              All Ack:               Abort/Commit
+                          - Write end
+
+Failure recovery:
+- If we have commit/abort for T we redo/undo T.
+-- If we are coordinator, resend commit/abort until we get ack, then
+   end.
+- If we have prepare, we are subordinate and we ask coordinator about
+  status. We get commit/abort, write commit/abort log, do action, then
+  write end log. Which is interesting given that subordinates don't
+  normally get end logs.
+- We have nothing: We abort, undo T, and write end log record.
+-- We don't know if subordinate or coordinator. If we get contacted,
+   we know we're coordinator, and we respond with abort
+
+Notes:
+- Coordinator doesn't need to send abort to shards that voted no
+- All log writes need to be forced to stable storage
+-- Means that whatever changes are going to happen to the node after
+   commit needs to be forced to stable storage after a prepare?
+- If a site we're communicating with fails:
+-- If we are coordinator: Abort
+-- If we haven't responded to Prepare: Abort
+-- If we have voted Yes: Block and periodically contact coordinator
+
+- Log messages consist of:
+-- Type (Abort/Prepare/Commit/End)
+-- Transaction Id
+-- Coordinator Id
+-- Subordinate Ids (if coordinator)
+
+Optimizations:
+- Coordinator can remove T from transaction table immediately after
+  aborting
+-- No information state and abort state -> same responses and recovery
+   mechanism
+-- Then subordinate doesn't need to Ack aborts
+-- Then coordinator doesn't need to keep names of subordinates in
+   abort record
+-- Aborts can just be appended instead of force written. If they don't
+   get written, the default is aborting anyway
+--- So why write them in the first place?
+- If a subordinate does no updates, it can respond with 'reader'
+  instead of 'Yes/No' to a prepare and skip log writing
+-- Coordinator treats as Yes, but doesn't send any more messages
+-- If everyone, including Coordinator, is a reader, then we can just
+   remove transaction from table and skip rest of protocol
+
+Questions/Issues:
+- Why no prepare for Coordinator?
+-- Seems if coordinator has prepare, then we just re-send prepare
+question to subordinates and they resend us answer?
+--- We won't gain any non-blocking power (e.g. if we have All Prepare,
+    then we still need to wait until coordinator comes up again)
+-- Why just abort instead?
+
+- If we have no log message, how do we know about a transaction?
+-- Must be by virtue of how we store transaction info on stable storage
+--- How do we know if it's been committed or we're in the middle of it?
+-- We use a transaction table with currently active transactions
+--- I guess we cancel all active transactions no matter what state
+    they're in when we recover from failure (mby barring read only?)?
+--- This also needs to store enough state to perform the transaction
+    (or undo I guess). Idempotence is best since we might do it
+    multiple times? Or we store data such that we start doing a
+    transaction and at the end write an end log that shows file
+    containing most recent totally committed transaction? And if we
+    have that we no longer need redo info and know where to start
+    from. And if we fail in middle we know to redo it and start from
+    point X. (But this imposes a probably unacceptable 2x space
+    overhead unless we can phrase things as additions?)
+
+- If coordinator fails, subordinates voting yes can't decide whether
+  to commit or abort until it recovers and the transaction is blocked.
+-- Subordinates can communicate among themselves, and if someone has
+   abort or commit, then we all know
+-- If everyone has Prepare, then we remain blocked on coordinator
+-- Solvable by adding third precommit phase (But not worth it in
+   practice)
+--- If coordinator crashes and there are a bunch of precommits, how do
+  subordinates know if it's decided to commit yet or abort because of
+  timeout issues? Or mby once it sends out precommit it must be
+  committed? But that doesn't make sense because then you have same
+  problem with no one receiving precommits and coordinator thinking it
+  sent them...???   
+
+- How do we redo/undo?
+-- Requires us to have some durable state to start with
+-- If we have a commit, we could have already done the commit (and
+   presumably written to durable state). So how does a redo work? Easy
+   if commands are idempotent. O.w.....
+-- Seems crazy that there's not an End for shards...
+
+- Why isn't there an End log for shards?
+-- They have to Redo/Undo in perpetuity?!
+
+Possibilities:
+- Coordinator
+-- Root
+--- +: Easier?
+--- -: More brittle? (Or equally brittle?)
+       Local commits still need to be kinda global.
+-- Anyone
+--- +: Might make local commits much nicer
+--- -: Important to not get multiple coordinator start points, which
+       may be hard in some combinations of traits
+
+- Commit response to client
+-- Block
+--- +: Easier
+--- -: Annoying
+-- Allow further action
+--- +: The obvious thing
+--- -: Need bookkeeping to handle commit failures and not obvious how
+       to report to client
+
+- Layout:
+-- Flat
+--- +: 2PC works 'as is', More obvious when nodes fail? Communication
+       sorta gets cheaper (since you only need one round of sends)
+--- -: Need to propagate shard changes (everywhere or to single
+       coordinator), Always need to ask everyone.
+-- Hierarchical
+--- +: Matches tree setup and shards only need local information,
+       Might be able to stop at a certain layer if you don't know
+       about transaction or something.
+       We need to know about what people below are doing in order to
+       know if we're OK anyway (i.e., if you move a subtree containing
+       a shard, and you've made updates in that shard you're mby not
+       OK? Or you allow it and update paths appropriately?!)
+--- -: Probably needs extra bookkeeping? Need to think hard and make
+       sure everything works properly (See Tom's paper?),
+       Probably need exponentially decreasing timeout intervals (well,
+       needs is strong)
+--- This seems to exist beyond just Tom, wikipedia has a Tree 2PC
+    protocol, which seems to do what you'd expect. And some fancier
+    Dynamic 2PC, which is just somewhat more clever
+
+- Allow an auto-replay commit version that discounts reads (or does a
+  check to see that they are unchanged and fails o.w. or somehow has
+  access to program logic, but this seems like the wrong things)?
+
+- Path intersection
+-- Writes (e.g. remove/move subtree and modify it in two different
+    transactions) seems fine
+-- Read/Move (Read a moved subtree) less obvious
+-- Read/Remove (Read a removed subtree) obviously not OK?
+
+
+- Locally:
+-- Commit locks
+--- Global
+---- +: Super easy and we just check that intersection of write paths
+        committed since start of T and read paths of T is empty! (I think?)
+---- -: Only supports one commit at a time, which may be prohibitive
+        in 2PC setting. In-particular, this lock needs to be acquired
+        after a prepare and not released until after a commit. (Unless
+        you're coordinator)
+--- Per-path (This is basically 2PL I think)
+---- +: Allows multiple commits to proceed at a time, which might be
+        necessary
+---- -: More locks and need to worry about lock ordering
+        Need prefix locks (e.g. a path lock should prevent prefixes of
+        that path from being locked too)
+---- We lock read/write (?) paths, then check intersection of write
+     paths committed since start of T and read paths of T is empty.
+----- If we don't lock reads, then a transaction can sneak in and do
+      writes for that path and commit before us.
+----- If we don't lock writes, then another transaction may do the
+      empty check, we commit and then we lose.
+----- Shared read locks and exclusive write locks should be fine
+---- Might be nicer if we do a quick intersection check to start, then
+     do the lock acquisition. So we fail early.
+
+- Could we supply all of these as parameters?!?!?
+
+
+Actual Plan:
+- Hierarchical, Per-path, Block?, Anyone, (Allow write/write, but not write/read?)
+-- Hierarchical benefits seem pretty solid. And easier combo with per-path.
+-- Global seems too restrictive (probably?)
+-- Continuing further action seems too difficult to deal with for
+   client since it may get a 'commit failed' anytime and not just
+   right after commit...
+-- If we block, having anyone be coordinator should be fine and is
+   nice for local changes. Not as clear if it's worth dev effort...
+-- Not a great reason, but seems reasonable since write/write could've
+   been performed in the opposite order and it would be fine. Although
+   I guess it could've used the value to determine if it should
+   move/remove subtree so maybe that's no bueno? Or all writes have to
+   happen at same time which means a removed subtree is real bad.
+
+- Try writing the prepare (as coordinator) and end (as subordinate
+  after commit)
+- Subordinate recovery by asking others is not as easy in a
+  hierarchical setting. Might want everyone to know about each other
+  anyway, and then we lose much of the benefit...
+
+Decisions to be made:
+- What combination of possibilities should we use? 
+- What do we store and how to stable storage?
+-- Log obviously
+-- Our data structure portion
+-- Transaction records (current live transactions?)
+--- We abort any live transactions when we wake up?
+--- How do we deal with being half-way through writing a transaction
+    to stable storage?
+---- Need to be able to go back to pre-transaction and then execute
+     again?
+---- End log and new stable data structure need to happen atomically
+     somehow
+---- If we can make a local tree delta, then that should be able to do
+     this if applying it to stable data is atomic?
+
+
+We want:
+- A replay log = transaction record (plus some more info)
