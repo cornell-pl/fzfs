@@ -1,0 +1,17 @@
+(executable
+  (name zfs_server)
+  (public_name zfs_server)
+  (libraries core async zfs)
+  (preprocess (pps ppx_jane))
+  (modules Zfs_server)
+  (package zfs)
+)
+
+(executable
+  (name zfs_client)
+  (public_name zfs_client)
+  (libraries core zfs)
+  (preprocess (pps ppx_jane))
+  (modules Zfs_client)
+  (package zfs)
+)

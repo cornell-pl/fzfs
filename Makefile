@@ -1,22 +1,25 @@
-TARGETS= zfs.exe #zfsServer.exe zfsClient.exe
+TARGETS= zfs_server.exe zfs_client.exe
+EXAMPLES=shelter.exe simple.exe
 
 .PHONY: all build clean %.exe
 
 all: build link
 
 build:
-	jbuilder build
+	dune build --profile release
 
-link: $(TARGETS)
+link: $(TARGETS) $(EXAMPLES)
 
 %.exe:
-	if [ ! -f $* ]; then ln -s _build/default/$@ $* ; fi
+	if [ ! -d executables ]; then mkdir executables; fi
+	if [ ! -f executables/$@ ]; then ln -s ../$$(find _build -name $@) executables/$@ ; fi
 
 test:
-	jbuilder build @runtest
+	dune build @runtest
 
 install:
-	jbuilder install
+	dune install
 
 clean:
-	rm -rf _build .utop *.install $(basename $(TARGETS))
+	dune clean;
+	cd executables; rm -f $(TARGETS) $(EXAMPLES); cd ..

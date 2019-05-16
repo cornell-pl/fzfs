@@ -1,0 +1,7 @@
+(library
+ (public_name zfs)
+ (name zfs)
+ (libraries core async)
+ (preprocess (pps ppx_jane ppx_deriving.std))
+ (modules ZFSAPI Types ZFSUtils ZFS)
+)

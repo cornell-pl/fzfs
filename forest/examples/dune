@@ -1,0 +1,24 @@
+(library
+  (name ExUtils)
+  (modules ExUtils)
+  (preprocess (pps ppx_jane))
+  (libraries core forest)
+)
+
+(executable
+  (public_name shelter)
+  (name shelter)
+  (preprocess (pps ppx_jane ppx_forest))
+  (libraries core forest ExUtils)
+  (modules Shelter)
+  (package forest)
+)
+
+(executable
+  (public_name simple)
+  (name simple)
+  (preprocess (pps ppx_jane ppx_forest))
+  (libraries core forest ExUtils str)
+  (modules Simple)
+  (package forest)
+)

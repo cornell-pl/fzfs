@@ -1,8 +1,0 @@
-(jbuild_version 1)
-
-(executable
-  ((name zfs)
-   (public_name zfs)
-   (libraries (core async DTZ))
-   (preprocess (pps (ppx_jane)))
-))

@@ -1,0 +1,44 @@
+# OCaml files
+*.annot
+*.cmo
+*.cma
+*.cmi
+*.a
+*.o
+*.cmx
+*.cmxs
+*.cmxa
+
+# Latex files
+*.pdf
+*.aux
+*.toc
+*.fls
+*.log
+*.out
+*.bbl
+*.blg
+*.vtc
+*.fdb_latexmk
+*.synctex.*
+
+# ocamlbuild working directory
+_build/
+
+# Dune files
+*.install
+
+# Merlin files
+*.merlin
+
+# Emacs files
+*~
+
+# VSCode files
+.vscode
+
+# ZFS Specific
+executables
+
+# Mac files
+*.DS_Store

@@ -1,0 +1,9 @@
+(library
+ (public_name ppx_forest)
+ (name ppx_forest)
+ (kind ppx_rewriter)
+ (ppx_runtime_libraries re ppxlib compiler-libs.common parser_helper ocaml-migrate-parsetree )
+ (libraries re ppxlib compiler-libs.common parser_helper ocaml-migrate-parsetree)
+ (preprocess (pps ppxlib.metaquot))
+ (modules PpxTXForestLib PpxTXForest)
+)
